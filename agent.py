@@ -33,6 +33,13 @@ class FishAudioTTS(tts.TTS):
         self.api_key = api_key
         self.voice_id_hindi = voice_id_hindi
         self.voice_id_english = voice_id_english
+        self._session = None
+
+    async def get_session(self):
+        import aiohttp
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
 
     def synthesize(
         self,
@@ -59,7 +66,6 @@ class FishAudioTTSChunkedStream(tts.ChunkedStream):
         self.sample_rate = sample_rate
 
     async def _run(self) -> None:
-        import aiohttp
         url = "https://api.fish.audio/v1/tts"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -76,38 +82,24 @@ class FishAudioTTSChunkedStream(tts.ChunkedStream):
             payload["reference_id"] = self.voice_id
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as response:
-                    if response.status != 200:
-                        err_text = await response.text()
-                        logger.error(f"Fish Audio TTS failed: status={response.status}, error={err_text}")
-                        return
+            session = await self.tts.get_session()
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status != 200:
+                    err_text = await response.text()
+                    logger.error(f"Fish Audio TTS failed: status={response.status}, error={err_text}")
+                    return
 
-                    # 16-bit PCM (2 bytes per sample), mono (1 channel).
-                    # 20ms frames: chunk_size = sample_rate * 0.02 * 2
-                    chunk_size = int(self.sample_rate * 0.02 * 2)
-                    buffer = b""
+                # 16-bit PCM (2 bytes per sample), mono (1 channel).
+                # 20ms frames: chunk_size = sample_rate * 0.02 * 2
+                chunk_size = int(self.sample_rate * 0.02 * 2)
+                buffer = b""
 
-                    async for chunk in response.content.iter_any():
-                        buffer += chunk
-                        while len(buffer) >= chunk_size:
-                            piece = buffer[:chunk_size]
-                            buffer = buffer[chunk_size:]
+                async for chunk in response.content.iter_any():
+                    buffer += chunk
+                    while len(buffer) >= chunk_size:
+                        piece = buffer[:chunk_size]
+                        buffer = buffer[chunk_size:]
 
-                            samples = len(piece) // 2
-                            frame = rtc.AudioFrame(
-                                data=piece,
-                                sample_rate=self.sample_rate,
-                                num_channels=1,
-                                samples_per_channel=samples
-                            )
-                            self._event_ch.send_nowait(tts.SynthesizedAudio(
-                                request_id=f"fish-{id(self)}",
-                                frame=frame
-                            ))
-
-                    if len(buffer) > 0:
-                        piece = buffer.ljust(chunk_size, b"\x00")
                         samples = len(piece) // 2
                         frame = rtc.AudioFrame(
                             data=piece,
@@ -119,6 +111,20 @@ class FishAudioTTSChunkedStream(tts.ChunkedStream):
                             request_id=f"fish-{id(self)}",
                             frame=frame
                         ))
+
+                if len(buffer) > 0:
+                    piece = buffer.ljust(chunk_size, b"\x00")
+                    samples = len(piece) // 2
+                    frame = rtc.AudioFrame(
+                        data=piece,
+                        sample_rate=self.sample_rate,
+                        num_channels=1,
+                        samples_per_channel=samples
+                    )
+                    self._event_ch.send_nowait(tts.SynthesizedAudio(
+                        request_id=f"fish-{id(self)}",
+                        frame=frame
+                    ))
         except Exception as e:
             logger.error(f"Fish Audio TTS synthesis failed: {e}", exc_info=True)
             raise
@@ -295,6 +301,7 @@ class AiohttpGeminiLLMStream(llm.LLMStream):
 
     def __init__(self, llm_instance, *, chat_ctx, fnc_ctx, conn_options, api_key, model):
         super().__init__(llm_instance, chat_ctx=chat_ctx, fnc_ctx=fnc_ctx, conn_options=conn_options)
+        self._llm = llm_instance
         self._api_key = api_key
         self._model = model
 
@@ -372,74 +379,74 @@ class AiohttpGeminiLLMStream(llm.LLMStream):
 
         # 3. Stream response: emit text chunks and register function calls
         try:
+            session = await self._llm.get_session()
             timeout = aiohttp.ClientTimeout(total=60, connect=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    if resp.status != 200:
-                        err = await resp.text()
-                        logger.error(f"Gemini API error {resp.status}: {err}")
-                        raise Exception(f"Gemini API returned {resp.status}: {err}")
+            async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    logger.error(f"Gemini API error {resp.status}: {err}")
+                    raise Exception(f"Gemini API returned {resp.status}: {err}")
 
-                    buffer = ""
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8", errors="replace")
-                        buffer += line
-                        while "\n" in buffer:
-                            idx = buffer.index("\n")
-                            chunk_line = buffer[:idx].strip()
-                            buffer = buffer[idx + 1:]
-                            if not chunk_line.startswith("data:"):
-                                continue
-                            data_str = chunk_line[len("data:"):].strip()
-                            if not data_str or data_str == "[DONE]":
-                                continue
-                            try:
-                                data = _json.loads(data_str)
-                            except _json.JSONDecodeError:
-                                continue
+                buffer = ""
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    buffer += line
+                    while "\n" in buffer:
+                        idx = buffer.index("\n")
+                        chunk_line = buffer[:idx].strip()
+                        buffer = buffer[idx + 1:]
+                        if not chunk_line.startswith("data:"):
+                            continue
+                        data_str = chunk_line[len("data:"):].strip()
+                        if not data_str or data_str == "[DONE]":
+                            continue
+                        try:
+                            data = _json.loads(data_str)
+                        except _json.JSONDecodeError:
+                            continue
 
-                            for cand in data.get("candidates", []):
-                                for part in cand.get("content", {}).get("parts", []):
-                                    # Skip internal thinking tokens
-                                    if part.get("thought", False):
-                                        continue
+                        for cand in data.get("candidates", []):
+                            for part in cand.get("content", {}).get("parts", []):
+                                # Skip internal thinking tokens
+                                if part.get("thought", False):
+                                    continue
 
-                                    # Text chunk -> emit to TTS pipeline
-                                    text_piece = part.get("text", "")
-                                    if text_piece:
-                                        chunk = llm.ChatChunk(
-                                            request_id=f"gemini-{id(self)}",
-                                            choices=[llm.Choice(
-                                                delta=llm.ChoiceDelta(
-                                                    role="assistant",
-                                                    content=text_piece,
-                                                ),
-                                                index=0,
-                                            )],
-                                        )
-                                        self._event_ch.send_nowait(chunk)
+                                # Text chunk -> emit to TTS pipeline
+                                text_piece = part.get("text", "")
+                                if text_piece:
+                                    chunk = llm.ChatChunk(
+                                        request_id=f"gemini-{id(self)}",
+                                        choices=[llm.Choice(
+                                            delta=llm.ChoiceDelta(
+                                                role="assistant",
+                                                content=text_piece,
+                                            ),
+                                            index=0,
+                                        )],
+                                    )
+                                    self._event_ch.send_nowait(chunk)
 
-                                    # Function call -> register so pipeline executes & saves to DB
-                                    elif "functionCall" in part:
-                                        fc = part["functionCall"]
-                                        fnc_name = fc.get("name", "")
-                                        fnc_args = fc.get("args", {})
-                                        logger.info(f"Gemini tool call requested: {fnc_name}({fnc_args})")
-                                        if self.fnc_ctx and fnc_name in self.fnc_ctx.ai_functions:
-                                            fnc_info = self.fnc_ctx.ai_functions[fnc_name]
-                                            call_id = f"gemini_{id(self)}_{fnc_name}"
-                                            try:
-                                                call_info = llm.FunctionCallInfo(
-                                                    function_info=fnc_info,
-                                                    arguments=fnc_args,
-                                                    call_id=call_id,
-                                                    raw_arguments=_json.dumps(fnc_args),
-                                                )
-                                                self._function_calls_info.append(call_info)
-                                            except Exception as exc:
-                                                logger.error(f"FunctionCallInfo error for {fnc_name}: {exc}")
-                                        else:
-                                            logger.warning(f"Gemini called unknown function: {fnc_name}")
+                                # Function call -> register so pipeline executes & saves to DB
+                                elif "functionCall" in part:
+                                    fc = part["functionCall"]
+                                    fnc_name = fc.get("name", "")
+                                    fnc_args = fc.get("args", {})
+                                    logger.info(f"Gemini tool call requested: {fnc_name}({fnc_args})")
+                                    if self.fnc_ctx and fnc_name in self.fnc_ctx.ai_functions:
+                                        fnc_info = self.fnc_ctx.ai_functions[fnc_name]
+                                        call_id = f"gemini_{id(self)}_{fnc_name}"
+                                        try:
+                                            call_info = llm.FunctionCallInfo(
+                                                function_info=fnc_info,
+                                                arguments=fnc_args,
+                                                call_id=call_id,
+                                                raw_arguments=_json.dumps(fnc_args),
+                                            )
+                                            self._function_calls_info.append(call_info)
+                                        except Exception as exc:
+                                            logger.error(f"FunctionCallInfo error for {fnc_name}: {exc}")
+                                    else:
+                                        logger.warning(f"Gemini called unknown function: {fnc_name}")
 
         except Exception as e:
             logger.error(f"AiohttpGeminiLLM error: {e}", exc_info=True)
@@ -453,6 +460,14 @@ class AiohttpGeminiLLM(llm.LLM):
         super().__init__()
         self._api_key = api_key
         self._model = model
+        self._session = None
+
+    async def get_session(self):
+        import aiohttp
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
 
     def chat(
         self,
@@ -819,8 +834,8 @@ Language:
         chat_ctx=chat_ctx,
         fnc_ctx=AppointmentBookingTools(),
         allow_interruptions=True,
-        interrupt_speech_duration=0.3,  # 0.3s of continuous speech needed to interrupt
-        interrupt_min_words=0,          # interrupt instantly on voice activity, don't wait for words
+        interrupt_speech_duration=0.5,  # 0.3s of continuous speech needed to interrupt
+        interrupt_min_words=2,          # interrupt instantly on voice activity, don't wait for words
         min_endpointing_delay=0.5,      # 0.5s silence before treating speech as complete
     )
 
