@@ -10,7 +10,7 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 from livekit.agents import JobContext, WorkerOptions, cli, llm, tts, APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.plugins import openai, silero
+from livekit.plugins import openai, silero, cartesia
 from livekit import rtc
 import config
 import appointments_db
@@ -26,7 +26,7 @@ logger = logging.getLogger("receptionist_agent")
 class FishAudioTTS(tts.TTS):
     def __init__(self, api_key: str, voice_id_hindi: str | None = None, voice_id_english: str | None = None, sample_rate: int = 24000):
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False),
+            capabilities=tts.TTSCapabilities(streaming=True),
             sample_rate=sample_rate,
             num_channels=1
         )
@@ -230,6 +230,30 @@ class EdgeTTSChunkedStream(tts.ChunkedStream):
 
 
 
+# ----- Dynamic Cartesia TTS — auto-detects and switches between English and Hindi -----
+class DynamicCartesiaTTS(tts.TTS):
+    """
+    Wraps two Cartesia TTS instances (one for English, one for Hindi) and dynamically
+    selects the correct language parameter based on text content to ensure natural accents.
+    """
+    def __init__(self, api_key: str, voice_id: str):
+        super().__init__(
+            capabilities=tts.TTSCapabilities(streaming=True),
+            sample_rate=24000,
+            num_channels=1
+        )
+        self.api_key = api_key
+        self.voice_id = voice_id
+        self.tts_english = cartesia.TTS(api_key=api_key, voice_id=voice_id, language="en", model="sonic-multilingual")
+        self.tts_hindi = cartesia.TTS(api_key=api_key, voice_id=voice_id, language="hi", model="sonic-multilingual")
+
+    def synthesize(self, text: str, *, conn_options: APIConnectOptions = None) -> tts.ChunkedStream:
+        if _detect_hindi(text):
+            return self.tts_hindi.synthesize(text, conn_options=conn_options)
+        else:
+            return self.tts_english.synthesize(text, conn_options=conn_options)
+
+
 # ----- Custom Gemini LLM using aiohttp (bypasses httpx/anyio Windows issues) -----
 
 def _extract_msg_text(content) -> str:
@@ -379,74 +403,99 @@ class AiohttpGeminiLLMStream(llm.LLMStream):
 
         # 3. Stream response: emit text chunks and register function calls
         try:
-            session = await self._llm.get_session()
-            timeout = aiohttp.ClientTimeout(total=60, connect=10)
-            async with session.post(url, headers=headers, json=payload, timeout=timeout) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    logger.error(f"Gemini API error {resp.status}: {err}")
-                    raise Exception(f"Gemini API returned {resp.status}: {err}")
+            timeout = aiohttp.ClientTimeout(total=10, connect=3.0)  # tight timeout prevents hangs
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status == 429:
+                        logger.warning("Gemini API returned 429 (Resource Exhausted). Yielding verbal rate-limit explanation.")
+                        user_lang_is_hindi = False
+                        if self.chat_ctx.messages:
+                            last_msg = self.chat_ctx.messages[-1]
+                            user_lang_is_hindi = _detect_hindi(_extract_msg_text(last_msg.content))
+                        
+                        if user_lang_is_hindi:
+                            limit_msg = "Maaf kijiyega, abhi line busy hai. Kripya thodi der baad phir se prayas karein."
+                        else:
+                            limit_msg = "I am sorry, but the line is currently busy. Please try speaking again in a few seconds."
+                            
+                        chunk = llm.ChatChunk(
+                            request_id=f"gemini-{id(self)}",
+                            choices=[llm.Choice(
+                                delta=llm.ChoiceDelta(
+                                    role="assistant",
+                                    content=limit_msg,
+                                ),
+                                index=0,
+                            )],
+                        )
+                        self._event_ch.send_nowait(chunk)
+                        return
 
-                buffer = ""
-                async for raw_line in resp.content:
-                    line = raw_line.decode("utf-8", errors="replace")
-                    buffer += line
-                    while "\n" in buffer:
-                        idx = buffer.index("\n")
-                        chunk_line = buffer[:idx].strip()
-                        buffer = buffer[idx + 1:]
-                        if not chunk_line.startswith("data:"):
-                            continue
-                        data_str = chunk_line[len("data:"):].strip()
-                        if not data_str or data_str == "[DONE]":
-                            continue
-                        try:
-                            data = _json.loads(data_str)
-                        except _json.JSONDecodeError:
-                            continue
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logger.error(f"Gemini API error {resp.status}: {err}")
+                        raise Exception(f"Gemini API returned {resp.status}: {err}")
 
-                        for cand in data.get("candidates", []):
-                            for part in cand.get("content", {}).get("parts", []):
-                                # Skip internal thinking tokens
-                                if part.get("thought", False):
-                                    continue
+                    buffer = ""
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", errors="replace")
+                        buffer += line
+                        while "\n" in buffer:
+                            idx = buffer.index("\n")
+                            chunk_line = buffer[:idx].strip()
+                            buffer = buffer[idx + 1:]
+                            if not chunk_line.startswith("data:"):
+                                continue
+                            data_str = chunk_line[len("data:"):].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                data = _json.loads(data_str)
+                            except _json.JSONDecodeError:
+                                continue
 
-                                # Text chunk -> emit to TTS pipeline
-                                text_piece = part.get("text", "")
-                                if text_piece:
-                                    chunk = llm.ChatChunk(
-                                        request_id=f"gemini-{id(self)}",
-                                        choices=[llm.Choice(
-                                            delta=llm.ChoiceDelta(
-                                                role="assistant",
-                                                content=text_piece,
-                                            ),
-                                            index=0,
-                                        )],
-                                    )
-                                    self._event_ch.send_nowait(chunk)
+                            for cand in data.get("candidates", []):
+                                for part in cand.get("content", {}).get("parts", []):
+                                    # Skip internal thinking tokens
+                                    if part.get("thought", False):
+                                        continue
 
-                                # Function call -> register so pipeline executes & saves to DB
-                                elif "functionCall" in part:
-                                    fc = part["functionCall"]
-                                    fnc_name = fc.get("name", "")
-                                    fnc_args = fc.get("args", {})
-                                    logger.info(f"Gemini tool call requested: {fnc_name}({fnc_args})")
-                                    if self.fnc_ctx and fnc_name in self.fnc_ctx.ai_functions:
-                                        fnc_info = self.fnc_ctx.ai_functions[fnc_name]
-                                        call_id = f"gemini_{id(self)}_{fnc_name}"
-                                        try:
-                                            call_info = llm.FunctionCallInfo(
-                                                function_info=fnc_info,
-                                                arguments=fnc_args,
-                                                call_id=call_id,
-                                                raw_arguments=_json.dumps(fnc_args),
-                                            )
-                                            self._function_calls_info.append(call_info)
-                                        except Exception as exc:
-                                            logger.error(f"FunctionCallInfo error for {fnc_name}: {exc}")
-                                    else:
-                                        logger.warning(f"Gemini called unknown function: {fnc_name}")
+                                    # Text chunk -> emit to TTS pipeline
+                                    text_piece = part.get("text", "")
+                                    if text_piece:
+                                        chunk = llm.ChatChunk(
+                                            request_id=f"gemini-{id(self)}",
+                                            choices=[llm.Choice(
+                                                delta=llm.ChoiceDelta(
+                                                    role="assistant",
+                                                    content=text_piece,
+                                                ),
+                                                index=0,
+                                            )],
+                                        )
+                                        self._event_ch.send_nowait(chunk)
+
+                                    # Function call -> register so pipeline executes & saves to DB
+                                    elif "functionCall" in part:
+                                        fc = part["functionCall"]
+                                        fnc_name = fc.get("name", "")
+                                        fnc_args = fc.get("args", {})
+                                        logger.info(f"Gemini tool call requested: {fnc_name}({fnc_args})")
+                                        if self.fnc_ctx and fnc_name in self.fnc_ctx.ai_functions:
+                                            fnc_info = self.fnc_ctx.ai_functions[fnc_name]
+                                            call_id = f"gemini_{id(self)}_{fnc_name}"
+                                            try:
+                                                call_info = llm.FunctionCallInfo(
+                                                    function_info=fnc_info,
+                                                    arguments=fnc_args,
+                                                    call_id=call_id,
+                                                    raw_arguments=_json.dumps(fnc_args),
+                                                )
+                                                self._function_calls_info.append(call_info)
+                                            except Exception as exc:
+                                                logger.error(f"FunctionCallInfo error for {fnc_name}: {exc}")
+                                        else:
+                                            logger.warning(f"Gemini called unknown function: {fnc_name}")
 
         except Exception as e:
             logger.error(f"AiohttpGeminiLLM error: {e}", exc_info=True)
@@ -460,14 +509,6 @@ class AiohttpGeminiLLM(llm.LLM):
         super().__init__()
         self._api_key = api_key
         self._model = model
-        self._session = None
-
-    async def get_session(self):
-        import aiohttp
-        if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-            self._session = aiohttp.ClientSession(connector=connector)
-        return self._session
 
     def chat(
         self,
@@ -660,8 +701,7 @@ class AppointmentBookingTools(llm.FunctionContext):
 async def entrypoint(ctx: JobContext):
     logger.info(f"Incoming call connection request. Job ID: {ctx.job.id}")
     
-    # Auto-initialize database tables and schema migrations
-    appointments_db.initialize_db()
+    # VAD and other configurations load next (non-blocking)
 
     # Voice Activity Detection — balanced: filters echo/noise but still detects normal speech
     # activation_threshold=0.6: detects clear speech but ignores faint background hum
@@ -672,8 +712,26 @@ async def entrypoint(ctx: JobContext):
         prefix_padding_duration=0.3,
     )
 
-    # Speech to Text: Check if NVIDIA Riva is configured, otherwise fallback to Groq Whisper API
-    if config.NVIDIA_API_KEY:
+    # Speech-to-Text: Check Cartesia (primary fast), NVIDIA Riva (secondary), otherwise fallback to Groq Whisper
+    if config.CARTESIA_API_KEY:
+        try:
+            logger.info("Using Cartesia Ink low-latency ASR (Speech-to-Text)")
+            stt_provider = cartesia.STT(
+                api_key=config.CARTESIA_API_KEY,
+                model="ink-2"  # Cartesia's state-of-the-art streaming ASR model
+            )
+        except Exception as e:
+            logger.exception("Failed to initialize Cartesia STT, falling back to NVIDIA Riva...")
+            # We don't overwrite config.CARTESIA_API_KEY here to avoid disabling it for TTS,
+            # but we use a local flag or proceed.
+            # Let's use a temporary flag
+            use_cartesia_stt = False
+        else:
+            use_cartesia_stt = True
+    else:
+        use_cartesia_stt = False
+
+    if not use_cartesia_stt and config.NVIDIA_API_KEY:
         try:
             logger.info("Using NVIDIA Riva ASR (Speech-to-Text)")
             from livekit.plugins import nvidia
@@ -686,7 +744,7 @@ async def entrypoint(ctx: JobContext):
             logger.exception("Failed to initialize NVIDIA Riva STT, falling back to Groq Whisper...")
             config.NVIDIA_API_KEY = None  # Force fallback
             
-    if not config.NVIDIA_API_KEY:
+    if not use_cartesia_stt and not config.NVIDIA_API_KEY:
         if config.GROQ_API_KEY:
             logger.info("Using Groq Cloud Whisper API for STT (multilingual: Hindi + English)")
             stt_provider = openai.STT(
@@ -703,8 +761,14 @@ async def entrypoint(ctx: JobContext):
                 api_key="faster-whisper-local"
             )
 
-    # Text-to-Speech: Check if Fish Audio is configured, otherwise fallback to EdgeTTS
-    if config.FISH_AUDIO_API_KEY:
+    # Text-to-Speech: Check Cartesia (primary fast), Fish Audio (secondary), otherwise EdgeTTS
+    if config.CARTESIA_API_KEY:
+        logger.info("Using Dynamic Cartesia Sonic (Hinglish/Hindi/English) Voice Engine for TTS")
+        tts_provider = DynamicCartesiaTTS(
+            api_key=config.CARTESIA_API_KEY,
+            voice_id=config.CARTESIA_VOICE_ID or "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
+        )
+    elif config.FISH_AUDIO_API_KEY:
         logger.info("Using Fish Audio Neural Voice Engine for TTS")
         tts_provider = FishAudioTTS(
             api_key=config.FISH_AUDIO_API_KEY,
@@ -737,8 +801,10 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.exception("Failed to initialize Google Gemini")
 
-    # 2. Groq Cloud (OpenAI compatible API)
-    if config.GROQ_API_KEY:
+    # 2. Groq Cloud fallback is disabled here because the user's ISP blocks api.groq.com.
+    # Leaving it enabled would cause 30-second connection hangs during fallbacks.
+    # Groq is only loaded if Google Gemini is missing.
+    if config.GROQ_API_KEY and not config.GOOGLE_API_KEY:
         try:
             logger.info("Fallback Chain: loading Groq provider...")
             groq_llm = openai.LLM(
@@ -771,35 +837,22 @@ async def entrypoint(ctx: JobContext):
 
     # Inject active calendar context
     today_str = datetime.now().strftime("%Y-%m-%d, %A")
-    system_prompt = f"""You are a professional, friendly voice receptionist named "Gunjan" for {config.CLINIC_NAME}.
-Your doctor is {config.DOCTOR_NAME}.
+    system_prompt = f"""You are "Gunjan", the friendly voice receptionist for {config.CLINIC_NAME} (Doctor: {config.DOCTOR_NAME}).
+Today is {today_str}. Schedule appointments only in the future.
+Your ONLY role is helping patients with these clinic/appointment tasks:
+1. Book: Collect name, phone, date, time. Check slots first.
+2. Query/Check: Use 'get_appointment_details' (default to patient name).
+3. Reschedule: Use 'reschedule_appointment' (default to name, collect old & new details).
+4. Cancel: Use 'cancel_appointment' (default to name, collect date & time).
+5. Info: Fees are ₹500. Doctor is available Mon-Sat, 9AM-5PM (Lunch 12PM-1PM, Closed Sun). Urgent calls connect to reception staff.
 
-Today is {today_str}. All appointments must be booked for a future date and time. Do not schedule appointments in the past.
-
-Your ONLY role is to help patients with appointment-related tasks:
-1. Book new appointments. Ask for the patient's full name, phone number, date, and preferred time. Always check available slots for a date before asking the patient to confirm a slot.
-2. Check/Query booking details. If a caller wants to verify, check, or query their appointment, use the 'get_appointment_details' tool. Default to asking for their Name to check, but you can accept name or phone number.
-3. Reschedule existing appointments. Use the 'reschedule_appointment' tool. Default to asking for their Name to identify the booking (patient_identifier), but accept name or phone number. Collect old date/time and new date/time.
-4. Cancel existing appointments. Use the 'cancel_appointment' tool. Default to asking for their Name to identify the booking (patient_identifier), but accept name or phone number. Collect date and time.
-
-Guidelines for handling calls:
-- Keep your responses very concise, friendly, and natural. This is a phone conversation.
-- Default to asking for the patient's Name (first and last name) as the primary identifier instead of phone number when they want to search, cancel, or reschedule. However, if they give you a phone number, use it.
-- If a scheduling tool reports failure, state the reason clearly (e.g. "No appointment found for that name at that time").
-- Never make up information. Use your tools to verify availability and bookings.
-
-Guidelines for off-topic or irrelevant questions:
-- Your role is strictly limited to appointment management for this clinic. You have no other purpose.
-- If a caller asks anything outside of booking, rescheduling, or cancelling appointments, acknowledge them briefly and warmly redirect the conversation back to how you can help them with the clinic.
-- You have no awareness of your technical implementation — no source code, no APIs, no AI model, no developer. You are simply "Gunjan, the receptionist". If pressed on these topics, treat the question as irrelevant to your role and naturally steer back to appointments.
-- You cannot give medical advice. If asked about symptoms, medications, or diagnoses, gently direct the caller to speak with clinic staff or their doctor directly.
-- You do not have memory of previous calls. Each call is a fresh conversation.
-- You do not browse the internet, answer trivia, tell jokes, or engage in general conversation. Stay focused and professional.
-
-Language:
-- Always respond in the same language the caller is using.
-- If the caller speaks Hindi, reply in Hindi (Devanagari script). If they speak English, reply in English.
-- If the caller mixes Hindi and English (Hinglish), match their style naturally.
+Guidelines:
+- Speak concisely and naturally in short sentences.
+- Always default to asking for Patient Name instead of phone.
+- Say clearly if a scheduling tool fails (e.g. no appointment found).
+- Never make up information. Use tools.
+- Refuse medical advice (refer to doctor/staff), off-topic, or technical questions; steer back to appointments.
+- CRITICAL Match Language: If user speaks English, reply ONLY in English. If Hindi, reply ONLY in Hindi (Devanagari). If Hinglish, match Hinglish. Never switch languages on your own.
 """
 
     # Extract caller identity from incoming SIP metadata if available
@@ -844,9 +897,21 @@ Language:
     agent.start(ctx.room)
 
     # ---- Proactive opening greeting ----
-    # Short and fast: immediately starts speaking, and can be interrupted by the user.
-    opening_greeting = "Namaste! Main Gunjan hoon. Kaise madad karoon? Hello! I'm Gunjan. How can I help you?"
-    await agent.say(opening_greeting, allow_interruptions=True)
+    # Pre-recorded greeting.wav plays with ZERO network latency as soon as user connects!
+    from livekit.agents.utils.audio import audio_frames_from_file
+    import os
+    
+    greeting_wav = os.path.join(os.getcwd(), "greeting.wav")
+    if os.path.exists(greeting_wav):
+        logger.info("Playing pre-synthesized greeting with ZERO network latency...")
+        await agent.say(
+            "Namaste! Main Gunjan hoon. Kaise madad karoon? Hello! I'm Gunjan. How can I help you?",
+            audio=audio_frames_from_file(greeting_wav),
+            allow_interruptions=True
+        )
+    else:
+        # Fallback if file not generated
+        await agent.say("Namaste! Main Gunjan hoon. Kaise madad karoon? Hello! I'm Gunjan. How can I help you?", allow_interruptions=True)
     logger.info("Opening greeting delivered.")
 
     # ---- Session recording: track conversation messages and save on disconnect ----
@@ -926,9 +991,53 @@ Language:
     # Register shutdown callback — fires automatically when the call ends
     ctx.add_shutdown_callback(_save_session_on_shutdown)
 
-    # Initial agent greeting
-    await agent.say(f"Hello, thank you for calling {config.CLINIC_NAME}. I'm the digital receptionist for {config.DOCTOR_NAME}. How can I help you today?")
+
+async def pre_generate_greeting():
+    """Pre-synthesizes the receptionist greeting into a local WAV file at startup to eliminate network latency."""
+    import os
+    import edge_tts as etts
+    import miniaudio
+    import io
+    import wave
+
+    filepath = os.path.join(os.getcwd(), "greeting.wav")
+    if not os.path.exists(filepath):
+        logger.info("Pre-synthesizing greeting to local WAV cache (greeting.wav)...")
+        try:
+            text = "Namaste! Main Gunjan hoon. Kaise madad karoon? Hello! I'm Gunjan. How can I help you?"
+            voice = "hi-IN-SwaraNeural"
+            communicate = etts.Communicate(text, voice)
+            mp3_buf = io.BytesIO()
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio":
+                    mp3_buf.write(chunk["data"])
+            
+            mp3_bytes = mp3_buf.getvalue()
+            if mp3_bytes:
+                decoded = miniaudio.decode(mp3_bytes, output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1, sample_rate=24000)
+                with wave.open(filepath, "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)  # 16-bit
+                    wav_file.setframerate(24000)
+                    wav_file.writeframes(bytes(decoded.samples))
+                logger.info("Saved pre-synthesized greeting to local file greeting.wav successfully.")
+        except Exception as e:
+            logger.error(f"Failed to pre-synthesize greeting: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
+    # 1. Initialize DB tables and migrations (run once at startup to avoid blocking calls)
+    logger.info("Initializing Postgres database tables...")
+    try:
+        appointments_db.initialize_db()
+    except Exception as e:
+        logger.critical(f"Failed to initialize database: {e}")
+
+    # 2. Pre-generate greeting.wav cache
+    try:
+        asyncio.run(pre_generate_greeting())
+    except Exception as e:
+        logger.error(f"Could not pre-synthesize greeting at startup: {e}")
+
+    # 3. Start LiveKit worker
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

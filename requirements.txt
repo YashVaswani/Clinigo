@@ -5,3 +5,6 @@ livekit-plugins-google>=0.8.0
 google-generativeai
 psycopg2-binary
 python-dotenv
+livekit-plugins-nvidia
+livekit-plugins-cartesia
+
