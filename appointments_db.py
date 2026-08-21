@@ -23,8 +23,16 @@ def get_pool():
             logger.error("DATABASE_URL is not set!")
             raise ValueError("DATABASE_URL environment variable is missing. Set it in the .env file.")
         try:
-            # Create a ThreadedConnectionPool for safe multithreading during concurrent calls
-            _pool = pool.ThreadedConnectionPool(1, 10, dsn=db_url)
+            # Create a ThreadedConnectionPool with TCP keepalives to prevent cloud timeouts
+            _pool = pool.ThreadedConnectionPool(
+                1, 10,
+                dsn=db_url,
+                connect_timeout=4,
+                keepalives=1,
+                keepalives_idle=20,
+                keepalives_interval=5,
+                keepalives_count=3
+            )
             logger.info("PostgreSQL connection pool initialized successfully.")
         except Exception as e:
             logger.exception("Failed to initialize PostgreSQL connection pool")
@@ -37,11 +45,10 @@ def get_db_cursor():
     conn = None
     try:
         conn = p.getconn()
-        # Verify connection health by executing a simple query
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
+        if conn.closed:
+            p.putconn(conn, close=True)
+            conn = p.getconn()
     except Exception:
-        # If connection is dead, discard and re-establish a fresh one
         if conn:
             p.putconn(conn, close=True)
             conn = None
@@ -242,8 +249,29 @@ def get_available_slots(date_str: str) -> list[str]:
 
     return available
 
+import re
+
+def normalize_indian_phone(phone_str: str) -> tuple[bool, str]:
+    """Validates and normalizes phone numbers to standard 10-digit Indian mobile numbers."""
+    if not phone_str:
+        return False, ""
+    digits = re.sub(r'\D', '', str(phone_str))
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    
+    if len(digits) == 10:
+        return True, digits
+    return False, digits
+
 def book_appointment(name: str, phone: str, date_str: str, time_str: str) -> dict:
     """Atomically books an appointment. Returns a status dictionary."""
+    is_valid, clean_phone = normalize_indian_phone(phone)
+    if not is_valid:
+        return {"success": False, "message": f"'{phone}' is not a valid 10-digit mobile number. Please provide a valid 10-digit Indian phone number."}
+    phone = clean_phone
+
     try:
         parsed_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         parsed_time = datetime.strptime(time_str, "%H:%M").time()
@@ -341,38 +369,66 @@ def get_appointment_details(search_query: str) -> dict:
         logger.exception("Error searching appointments")
         return {"success": False, "message": "An internal database error occurred while searching."}
 
-def cancel_appointment(patient_identifier: str, date_str: str, time_str: str) -> dict:
-    """Cancels an existing appointment matching the patient name or phone, date, and time."""
+def cancel_appointment(patient_identifier: str = None, date_str: str = None, time_str: str = None, name: str = None, phone: str = None) -> dict:
+    """Cancels an existing appointment matching the patient name or phone, date, and optionally time."""
+    identifier = (patient_identifier or phone or name or "").strip()
+    if not identifier:
+        return {"success": False, "message": "Patient name or phone number is required to cancel an appointment."}
+
+    if not date_str:
+        return {"success": False, "message": "Appointment date is required."}
+
     try:
         parsed_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        parsed_time = datetime.strptime(time_str, "%H:%M").time()
     except ValueError:
-        return {"success": False, "message": "Invalid date or time format."}
+        return {"success": False, "message": "Invalid date format. Please use YYYY-MM-DD."}
+
+    parsed_time = None
+    if time_str:
+        try:
+            parsed_time = datetime.strptime(time_str, "%H:%M").time()
+        except ValueError:
+            parsed_time = None
 
     try:
         with get_db_cursor() as cur:
-            cur.execute(
-                """
-                UPDATE appointments
-                SET status = 'CANCELLED'
-                WHERE (LOWER(patient_name) = LOWER(%s) OR patient_phone = %s)
-                  AND appointment_date = %s AND appointment_time = %s AND status = 'BOOKED'
-                RETURNING id, patient_name, patient_phone
-                """,
-                (patient_identifier, patient_identifier, parsed_date, parsed_time)
-            )
+            if parsed_time:
+                cur.execute(
+                    """
+                    UPDATE appointments
+                    SET status = 'CANCELLED'
+                    WHERE (LOWER(patient_name) = LOWER(%s) OR patient_phone = %s)
+                      AND appointment_date = %s AND appointment_time = %s AND status = 'BOOKED'
+                    RETURNING id, patient_name, patient_phone, appointment_time
+                    """,
+                    (identifier, identifier, parsed_date, parsed_time)
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE appointments
+                    SET status = 'CANCELLED'
+                    WHERE (LOWER(patient_name) = LOWER(%s) OR patient_phone = %s)
+                      AND appointment_date = %s AND status = 'BOOKED'
+                    RETURNING id, patient_name, patient_phone, appointment_time
+                    """,
+                    (identifier, identifier, parsed_date)
+                )
             row = cur.fetchone()
             if not row:
-                return {"success": False, "message": "No active appointment found for that name/phone at this date and time."}
-            
-        logger.info(f"Cancelled appt: Name/Phone={patient_identifier}, Date={date_str}, Time={time_str}")
-        return {"success": True, "message": f"Appointment for {row[1]} ({row[2]}) has been cancelled successfully."}
+                return {"success": False, "message": f"No active appointment found for '{identifier}' on {date_str}."}
+
+        logger.info(f"Cancelled appt: Name/Phone={identifier}, Date={date_str}, Time={row[3]}")
+        return {"success": True, "message": f"Appointment for {row[1]} ({row[2]}) on {date_str} at {row[3]} has been cancelled successfully."}
     except Exception as e:
         logger.exception("Error cancelling appointment")
         return {"success": False, "message": "An internal database error occurred."}
 
-def reschedule_appointment(patient_identifier: str, old_date_str: str, old_time_str: str, new_date_str: str, new_time_str: str) -> dict:
+def reschedule_appointment(patient_identifier: str = None, old_date_str: str = None, old_time_str: str = None, new_date_str: str = None, new_time_str: str = None, name: str = None, phone: str = None) -> dict:
     """Atomically reschedules an appointment by cancelling the old one and booking a new one."""
+    identifier = (patient_identifier or phone or name or "").strip()
+    if not identifier:
+        return {"success": False, "message": "Patient name or phone number is required to reschedule."}
     try:
         old_date = datetime.strptime(old_date_str, "%Y-%m-%d").date()
         old_time = datetime.strptime(old_time_str, "%H:%M").time()
@@ -409,10 +465,10 @@ def reschedule_appointment(patient_identifier: str, old_date_str: str, old_time_
                 """
                 SELECT id, patient_name, patient_phone 
                 FROM appointments 
-                WHERE (LOWER(patient_name) = LOWER(%s) OR patient_phone = %s)
+                WHERE (LOWER(patient_name) = LOWER(%s) OR patient_phone = %s OR LOWER(patient_name) = LOWER(%s) OR patient_phone = %s)
                   AND appointment_date = %s AND appointment_time = %s AND status = 'BOOKED'
                 """,
-                (patient_identifier, patient_identifier, old_date, old_time)
+                (identifier, identifier, name or identifier, phone or identifier, old_date, old_time)
             )
             row = cur.fetchone()
             if not row:
@@ -437,7 +493,7 @@ def reschedule_appointment(patient_identifier: str, old_date_str: str, old_time_
             )
             new_id = cur.fetchone()[0]
 
-        logger.info(f"Rescheduled appt: Name/Phone={patient_identifier} from {old_date_str} {old_time_str} to {new_date_str} {new_time_str} (New ID={new_id})")
+        logger.info(f"Rescheduled appt: Name/Phone={identifier} from {old_date_str} {old_time_str} to {new_date_str} {new_time_str} (New ID={new_id})")
         return {"success": True, "message": f"Appointment successfully rescheduled to {new_date_str} at {new_time_str}."}
 
     except psycopg2.errors.UniqueViolation:

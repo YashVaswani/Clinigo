@@ -9,11 +9,25 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 from livekit.agents import JobContext, WorkerOptions, cli, llm, tts, APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
-from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.plugins import openai, silero
+from livekit.agents.voice import Agent as VoicePipelineAgent
+from livekit.plugins import openai, silero, cartesia
 from livekit import rtc
 import config
 import appointments_db
+
+# --- LiveKit Agents 1.x Compatibility Layer ---
+class TypeInfo:
+    def __init__(self, description: str = "", choices: list = None, default = None):
+        self.description = description
+        self.choices = choices
+        self.default = default
+
+class FunctionContextWrapper:
+    pass
+
+llm.TypeInfo = TypeInfo
+llm.FunctionContext = FunctionContextWrapper
+llm.ai_callable = llm.function_tool
 
 # Configure structured logging
 logging.basicConfig(
@@ -224,6 +238,28 @@ class EdgeTTSChunkedStream(tts.ChunkedStream):
 
 
 
+# ----- Dynamic Cartesia TTS — auto-detects and switches between English and Hindi -----
+class DynamicCartesiaTTS(tts.TTS):
+    """
+    Wraps two Cartesia TTS instances (one for English, one for Hindi) and dynamically
+    selects the correct language parameter based on text content to ensure natural accents.
+    """
+    def __init__(self, api_key: str, voice_id: str):
+        super().__init__(
+            capabilities=tts.TTSCapabilities(streaming=True),
+            sample_rate=24000,
+            num_channels=1
+        )
+        self.api_key = api_key
+        self.voice_id = voice_id
+        self.tts_english = cartesia.TTS(api_key=api_key, voice=voice_id, language="en", model="sonic-2")
+        self.tts_hindi = cartesia.TTS(api_key=api_key, voice=voice_id, language="hi", model="sonic-2")
+
+    def synthesize(self, text: str, *, conn_options: APIConnectOptions = None) -> tts.ChunkedStream:
+        if _detect_hindi(text):
+            return self.tts_hindi.synthesize(text, conn_options=conn_options)
+        else:
+            return self.tts_english.synthesize(text, conn_options=conn_options)
 # ----- Custom Gemini LLM using aiohttp (bypasses httpx/anyio Windows issues) -----
 
 def _extract_msg_text(content) -> str:
@@ -242,49 +278,83 @@ def _extract_msg_text(content) -> str:
 
 
 def _build_gemini_tools(fnc_ctx) -> list | None:
-    """Convert LiveKit FunctionContext to Gemini tools format."""
+    """Convert LiveKit FunctionContext (or object with function_tools) to Gemini tools format."""
     if not fnc_ctx:
         return None
     import inspect
+    from typing import get_type_hints, Annotated
 
     type_map = {str: "STRING", int: "INTEGER", float: "NUMBER", bool: "BOOLEAN"}
     function_declarations = []
 
-    for fnc_name, fnc_info in fnc_ctx.ai_functions.items():
+    # Find the list of FunctionTools on fnc_ctx
+    tools = llm.find_function_tools(fnc_ctx)
+
+    for tool in tools:
+        fnc_name = tool.info.name
+        fnc_desc = tool.info.description or ""
+        
         properties: dict = {}
         required: list = []
+        
+        # Get type hints (including Annotated metadata)
+        hints = get_type_hints(tool._func, include_extras=True)
+        sig = inspect.signature(tool._func)
+        
         try:
-            for arg_name, arg_info in fnc_info.arguments.items():
-                py_type = getattr(arg_info, "type", str)
-                if hasattr(py_type, "__args__"):
-                    py_type = py_type.__args__[0]
+            for param_name, param in sig.parameters.items():
+                if param_name == "self":
+                    continue
+                
+                py_type = str
+                desc = ""
+                choices = None
+                
+                # Check if parameter has annotation
+                if param_name in hints:
+                    annotation = hints[param_name]
+                    # Check if it is Annotated[...]
+                    if hasattr(annotation, "__metadata__"):
+                        py_type = annotation.__origin__
+                        metadata = annotation.__metadata__
+                        for meta in metadata:
+                            if isinstance(meta, llm.TypeInfo):
+                                desc = meta.description
+                                choices = meta.choices
+                    else:
+                        py_type = annotation
+                
+                # Map to Gemini type
                 gemini_type = type_map.get(py_type, "STRING")
                 prop: dict = {"type": gemini_type}
-                desc = getattr(arg_info, "description", "") or ""
                 if desc:
                     prop["description"] = desc
-                choices = getattr(arg_info, "choices", None)
                 if choices:
                     prop["enum"] = [str(c) for c in choices]
-                properties[arg_name] = prop
-                default = getattr(arg_info, "default", inspect.Parameter.empty)
-                if default is inspect.Parameter.empty:
-                    required.append(arg_name)
+                
+                properties[param_name] = prop
+                
+                if param.default is inspect.Parameter.empty:
+                    required.append(param_name)
+                    
         except Exception as ex:
             logger.warning(f"Skipping tool {fnc_name} due to introspection error: {ex}")
             continue
+            
         decl: dict = {
             "name": fnc_name,
-            "description": getattr(fnc_info, "description", "") or "",
+            "description": fnc_desc,
             "parameters": {"type": "OBJECT", "properties": properties},
         }
         if required:
             decl["parameters"]["required"] = required
+            
         function_declarations.append(decl)
-
+        
     if not function_declarations:
         return None
-    return [{"functionDeclarations": function_declarations}]
+        
+    return [{"function_declarations": function_declarations}]
 
 
 class AiohttpGeminiLLMStream(llm.LLMStream):
