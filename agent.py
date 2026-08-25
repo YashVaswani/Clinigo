@@ -36,206 +36,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("receptionist_agent")
 
-# ----- Fish Audio TTS provider (multilingual, voice cloning, API-based) -----
-class FishAudioTTS(tts.TTS):
-    def __init__(self, api_key: str, voice_id_hindi: str | None = None, voice_id_english: str | None = None, sample_rate: int = 24000):
-        super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False),
-            sample_rate=sample_rate,
-            num_channels=1
-        )
-        self.api_key = api_key
-        self.voice_id_hindi = voice_id_hindi
-        self.voice_id_english = voice_id_english
-
-    def synthesize(
-        self,
-        text: str,
-        *,
-        conn_options: APIConnectOptions = None,
-    ) -> tts.ChunkedStream:
-        # Dynamically auto-detect language and select the corresponding voice
-        selected_voice = self.voice_id_hindi if _detect_hindi(text) else self.voice_id_english
-        return FishAudioTTSChunkedStream(
-            tts=self,
-            input_text=text,
-            conn_options=conn_options,
-            api_key=self.api_key,
-            voice_id=selected_voice,
-            sample_rate=self.sample_rate
-        )
-
-class FishAudioTTSChunkedStream(tts.ChunkedStream):
-    def __init__(self, tts, input_text, conn_options, api_key, voice_id, sample_rate):
-        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
-        self.api_key = api_key
-        self.voice_id = voice_id
-        self.sample_rate = sample_rate
-
-    async def _run(self) -> None:
-        import aiohttp
-        url = "https://api.fish.audio/v1/tts"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "text": self.input_text,
-            "format": "pcm",
-            "sample_rate": self.sample_rate,
-            "normalize": True,
-            "latency": "normal"
-        }
-        if self.voice_id:
-            payload["reference_id"] = self.voice_id
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as response:
-                    if response.status != 200:
-                        err_text = await response.text()
-                        logger.error(f"Fish Audio TTS failed: status={response.status}, error={err_text}")
-                        return
-
-                    # 16-bit PCM (2 bytes per sample), mono (1 channel).
-                    # 20ms frames: chunk_size = sample_rate * 0.02 * 2
-                    chunk_size = int(self.sample_rate * 0.02 * 2)
-                    buffer = b""
-
-                    async for chunk in response.content.iter_any():
-                        buffer += chunk
-                        while len(buffer) >= chunk_size:
-                            piece = buffer[:chunk_size]
-                            buffer = buffer[chunk_size:]
-
-                            samples = len(piece) // 2
-                            frame = rtc.AudioFrame(
-                                data=piece,
-                                sample_rate=self.sample_rate,
-                                num_channels=1,
-                                samples_per_channel=samples
-                            )
-                            self._event_ch.send_nowait(tts.SynthesizedAudio(
-                                request_id=f"fish-{id(self)}",
-                                frame=frame
-                            ))
-
-                    if len(buffer) > 0:
-                        piece = buffer.ljust(chunk_size, b"\x00")
-                        samples = len(piece) // 2
-                        frame = rtc.AudioFrame(
-                            data=piece,
-                            sample_rate=self.sample_rate,
-                            num_channels=1,
-                            samples_per_channel=samples
-                        )
-                        self._event_ch.send_nowait(tts.SynthesizedAudio(
-                            request_id=f"fish-{id(self)}",
-                            frame=frame
-                        ))
-        except Exception as e:
-            logger.error(f"Fish Audio TTS synthesis failed: {e}", exc_info=True)
-            raise
-
-
-# ----- EdgeTTS provider — multilingual Hindi + English, free, no API key -----
-# Uses Microsoft Edge neural voices via edge-tts (already installed).
-# Voices: hi-IN-SwaraNeural (Hindi female), en-IN-NeerjaNeural (English/Indian female)
-# MP3 output from edge-tts is decoded to PCM using miniaudio (no ffmpeg needed).
-
 def _detect_hindi(text: str) -> bool:
     """Returns True if the text contains a significant amount of Devanagari (Hindi) characters."""
     devanagari_count = sum(1 for ch in text if '\u0900' <= ch <= '\u097F')
     return devanagari_count > len(text) * 0.2  # >20% Devanagari = treat as Hindi
-
-
-class EdgeTTS(tts.TTS):
-    """
-    Multilingual TTS using Microsoft Edge neural voices.
-    Auto-selects Hindi voice for Hindi text and English (Indian accent) for English text.
-    """
-    VOICE_HINDI   = "hi-IN-SwaraNeural"      # Hindi female
-    VOICE_ENGLISH = "en-IN-NeerjaNeural"     # English, Indian accent female
-    SAMPLE_RATE   = 24000                     # Edge TTS outputs 24kHz
-
-    def __init__(self):
-        super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False),
-            sample_rate=self.SAMPLE_RATE,
-            num_channels=1,
-        )
-
-    def synthesize(
-        self,
-        text: str,
-        *,
-        conn_options: APIConnectOptions = None,
-    ) -> tts.ChunkedStream:
-        voice = self.VOICE_HINDI if _detect_hindi(text) else self.VOICE_ENGLISH
-        return EdgeTTSChunkedStream(
-            tts=self,
-            input_text=text,
-            conn_options=conn_options,
-            voice=voice,
-        )
-
-
-class EdgeTTSChunkedStream(tts.ChunkedStream):
-    def __init__(self, tts, input_text, conn_options, voice):
-        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
-        self._voice = voice
-
-    async def _run(self) -> None:
-        import io
-        import miniaudio
-        import edge_tts as etts
-
-        try:
-            # Collect all MP3 bytes from edge-tts stream
-            mp3_buf = io.BytesIO()
-            communicate = etts.Communicate(self.input_text, self._voice)
-            async for chunk in communicate.stream():
-                if chunk.get("type") == "audio":
-                    mp3_buf.write(chunk["data"])
-
-            mp3_bytes = mp3_buf.getvalue()
-            if not mp3_bytes:
-                logger.error("EdgeTTS: No audio data received from edge-tts")
-                return
-
-            # Decode MP3 → PCM (16-bit signed, mono, 24kHz) using miniaudio
-            decoded = miniaudio.decode(mp3_bytes, output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1, sample_rate=24000)
-            raw_pcm = bytes(decoded.samples)
-
-            sr   = decoded.sample_rate
-            ch   = decoded.nchannels
-            bps  = 2  # bytes per sample (16-bit)
-            chunk_size = int(sr * 0.02 * bps * ch)   # 20ms frames
-
-            for i in range(0, len(raw_pcm), chunk_size):
-                piece = raw_pcm[i: i + chunk_size]
-                if not piece:
-                    continue
-                if len(piece) < chunk_size:
-                    piece = piece + b'\x00' * (chunk_size - len(piece))
-
-                frame = rtc.AudioFrame(
-                    data=piece,
-                    sample_rate=sr,
-                    num_channels=ch,
-                    samples_per_channel=len(piece) // (bps * ch),
-                )
-                self._event_ch.send_nowait(
-                    tts.SynthesizedAudio(
-                        request_id=f"edge-{id(self)}",
-                        frame=frame,
-                    )
-                )
-
-        except Exception as e:
-            logger.error(f"EdgeTTS synthesis failed: {e}", exc_info=True)
-            raise
-
 
 
 # ----- Dynamic Cartesia TTS — auto-detects and switches between English and Hindi -----
@@ -727,48 +531,19 @@ async def entrypoint(ctx: JobContext):
         prefix_padding_duration=0.3,
     )
 
-    # Speech to Text: Check if NVIDIA Riva is configured, otherwise fallback to Groq Whisper API
-    if config.NVIDIA_API_KEY:
-        try:
-            logger.info("Using NVIDIA Riva ASR (Speech-to-Text)")
-            from livekit.plugins import nvidia
-            stt_provider = nvidia.STT(
-                api_key=config.NVIDIA_API_KEY,
-                server=config.NVIDIA_RIVA_SERVER,
-                language_code="en-US"  # Can also be set to "hi-IN" for Hindi
-            )
-        except Exception as e:
-            logger.exception("Failed to initialize NVIDIA Riva STT, falling back to Groq Whisper...")
-            config.NVIDIA_API_KEY = None  # Force fallback
-            
-    if not config.NVIDIA_API_KEY:
-        if config.GROQ_API_KEY:
-            logger.info("Using Groq Cloud Whisper API for STT (multilingual: Hindi + English)")
-            stt_provider = openai.STT(
-                model="whisper-large-v3-turbo",
-                base_url="https://api.groq.com/openai/v1",
-                api_key=config.GROQ_API_KEY,
-                language="hi",   # Whisper multilingual: 'hi' transcribes Hindi correctly and still handles English
-            )
-        else:
-            logger.warning("GROQ_API_KEY missing, falling back to local Whisper server URL")
-            stt_provider = openai.STT(
-                model="whisper-1",
-                base_url=config.WHISPER_URL,
-                api_key="faster-whisper-local"
-            )
+    # Speech-to-Text: Cartesia Ink-Whisper (Multilingual Hindi + English + Hinglish)
+    logger.info("Using Cartesia Ink-Whisper STT")
+    stt_provider = cartesia.STT(
+        api_key=config.CARTESIA_API_KEY,
+        model="ink-whisper"
+    )
 
-    # Text-to-Speech: Check if Fish Audio is configured, otherwise fallback to EdgeTTS
-    if config.FISH_AUDIO_API_KEY:
-        logger.info("Using Fish Audio Neural Voice Engine for TTS")
-        tts_provider = FishAudioTTS(
-            api_key=config.FISH_AUDIO_API_KEY,
-            voice_id_hindi=config.FISH_AUDIO_VOICE_ID_HINDI,
-            voice_id_english=config.FISH_AUDIO_VOICE_ID_ENGLISH
-        )
-    else:
-        logger.info("Using EdgeTTS (multilingual: hi-IN-SwaraNeural / en-IN-NeerjaNeural)")
-        tts_provider = EdgeTTS()
+    # Text-to-Speech: Cartesia Sonic-Turbo Neural Voice Engine
+    logger.info(f"Using Cartesia TTS (Voice: {config.CARTESIA_VOICE_ID or 'c6bbc7d5-4b35-4d49-b1c6-4417019a61c1'})")
+    tts_provider = DynamicCartesiaTTS(
+        api_key=config.CARTESIA_API_KEY,
+        voice_id=config.CARTESIA_VOICE_ID or "c6bbc7d5-4b35-4d49-b1c6-4417019a61c1"
+    )
 
     # Compile the list of LLM providers for the fallback chain
     llms = []

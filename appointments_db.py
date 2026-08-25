@@ -45,28 +45,43 @@ def get_db_cursor():
     conn = None
     try:
         conn = p.getconn()
-        if conn.closed:
-            p.putconn(conn, close=True)
+        # Test if connection is alive; recover gracefully if stale
+        try:
+            conn.cursor().execute("SELECT 1")
+        except Exception:
+            logger.warning("Stale database connection detected. Getting fresh connection...")
+            try:
+                p.putconn(conn, close=True)
+            except Exception:
+                pass
             conn = p.getconn()
-    except Exception:
+    except Exception as e:
         if conn:
-            p.putconn(conn, close=True)
-            conn = None
-        logger.warning("Stale database connection detected. Reconnecting...")
-        conn = p.getconn()
-    
+            try:
+                p.putconn(conn, close=True)
+            except Exception:
+                pass
+        logger.error(f"Failed to acquire DB connection: {e}")
+        raise
+
     try:
         with conn.cursor() as cur:
             yield cur
             conn.commit()
     except Exception as e:
-        if conn:
+        try:
             conn.rollback()
+        except Exception:
+            pass
         logger.exception("Database transaction error, rolling back changes")
         raise e
     finally:
         if conn:
-            p.putconn(conn)
+            try:
+                p.putconn(conn)
+            except Exception:
+                pass
+
 
 def initialize_db() -> None:
     """Creates the appointments table, indexes, and partial unique constraint to prevent double bookings."""
@@ -160,13 +175,13 @@ def log_call_session(
 
 
 def get_call_sessions(limit: int = 50) -> list[dict]:
-    """Returns the most recent call sessions for review."""
+    """Returns the most recent call sessions for review with full conversation transcripts."""
     try:
         with get_db_cursor() as cur:
             cur.execute(
                 """
                 SELECT session_id, caller_phone, started_at, ended_at,
-                       duration_seconds, summary, outcome
+                       duration_seconds, transcript, summary, outcome
                 FROM call_sessions
                 ORDER BY started_at DESC
                 LIMIT %s
@@ -178,7 +193,8 @@ def get_call_sessions(limit: int = 50) -> list[dict]:
             {
                 "session_id": r[0], "caller_phone": r[1],
                 "started_at": str(r[2]), "ended_at": str(r[3]),
-                "duration_seconds": r[4], "summary": r[5], "outcome": r[6]
+                "duration_seconds": r[4], "transcript": r[5] or "",
+                "summary": r[6] or "", "outcome": r[7] or "COMPLETED"
             }
             for r in rows
         ]
