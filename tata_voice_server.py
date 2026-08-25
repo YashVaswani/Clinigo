@@ -68,10 +68,13 @@ def _normalize_text_for_speech(text: str) -> str:
     text = re.sub(r'(\d{1,2}):00\s*(AM|PM|am|pm)', r'\1 \2', text)
     text = re.sub(r'(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)', r'\1 \2 \3', text)
 
-    # 3. Convert ₹500 / Rs 500 to spoken words
+    # 3. Convert ₹ / Rs / Rs. to spoken words
     is_hindi = _detect_hindi(text)
     curr_word = "रुपये" if is_hindi else "rupees"
-    text = re.sub(r'[₹|Rs\.?]\s*(\d+)', rf'\1 {curr_word}', text)
+    text = re.sub(r'\b[Rr][Ss]\.?\s*(\d+)', rf'\1 {curr_word}', text)
+    text = re.sub(r'[₹]\s*(\d+)', rf'\1 {curr_word}', text)
+    text = re.sub(r'\b[Rr][Ss]\.?\b', curr_word, text)
+    text = re.sub(r'[₹]', f" {curr_word} ", text)
 
     # 4. Format phone numbers (7 to 13 digits) into spaced digits
     def format_phone(m):
@@ -614,6 +617,7 @@ DYNAMIC VOICE & CONVERSATION RULES
 - DYNAMIC RESPONSES: Do NOT use pre-scripted or hardcoded reply templates. Respond dynamically, keeping the conversation natural, friendly, and human-like.
 - LANGUAGE ADAPTABILITY: If the caller speaks Hindi or Hinglish, respond entirely in natural Hindi/Hinglish. If they speak English, respond in English.
 - MEMORY RESILIENCY: Once the caller has chosen a date/time or provided their name, NEVER forget, clear, or request these details again in this call. If the phone number is invalid, too short, or fragmented, do NOT ask for the patient's name or date/time again. Maintain the confirmed name and slot in memory, and ask ONLY for the phone number. Additionally, if the caller repeats, restates, or corrects the date/time slot, but they have already provided the patient's name earlier in the conversation, do NOT ask for the name again. Skip directly to asking for the mobile number.
+- NO RAW FORMATS IN SPEECH: NEVER ask the caller to speak dates in "YYYY-MM-DD" format or mention raw date formats. Let callers speak dates naturally (e.g. "tomorrow", "August 26th"). You must translate their natural spoken date into the YYYY-MM-DD format silently before calling tools.
 - OUT-OF-SCOPE RULES:
   * If asked about specific medical advice, dosages, or prescriptions, tell the caller you cannot provide medical advice over the phone and suggest consulting the doctor during their visit.
   * If asked about completely unrelated topics (news, other businesses, general questions), politely redirect them to clinic queries.
