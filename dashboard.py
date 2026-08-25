@@ -498,6 +498,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             border: 1px solid rgba(244, 63, 94, 0.3);
         }
 
+        .badge-completed {
+            background: rgba(59, 130, 246, 0.12);
+            color: #60a5fa;
+            border: 1px solid rgba(59, 130, 246, 0.3);
+        }
+
         .btn-cancel-action {
             background: rgba(244, 63, 94, 0.1);
             color: #fb7185;
@@ -1072,7 +1078,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
-            tbody.innerHTML = filtered.map(a => `
+            tbody.innerHTML = filtered.map(a => {
+                let badgeClass = 'badge-cancelled';
+                let statusText = '✕ Cancelled';
+                if (a.status === 'BOOKED') {
+                    badgeClass = 'badge-booked';
+                    statusText = '● Confirmed Booked';
+                } else if (a.status === 'COMPLETED') {
+                    badgeClass = 'badge-completed';
+                    statusText = '✓ Completed';
+                }
+
+                return `
                 <tr>
                     <td style="color: var(--text-tertiary); font-weight: 600; font-family: monospace;">#${a.id}</td>
                     <td>
@@ -1085,8 +1102,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <td><strong style="color: #fff;">${a.date}</strong></td>
                     <td><span class="time-pill">🕒 ${formatTime(a.time)}</span></td>
                     <td>
-                        <span class="badge-status ${a.status === 'BOOKED' ? 'badge-booked' : 'badge-cancelled'}">
-                            ${a.status === 'BOOKED' ? '● Confirmed Booked' : '✕ Cancelled'}
+                        <span class="badge-status ${badgeClass}">
+                            ${statusText}
                         </span>
                     </td>
                     <td>
@@ -1095,7 +1112,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         ` : '<span style="color: var(--text-tertiary); font-size: 0.85rem;">None</span>'}
                     </td>
                 </tr>
-            `).join('');
+                `;
+            }).join('');
         }
 
         async function fetchSlotMatrix() {
@@ -1138,7 +1156,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const container = document.getElementById('callLogsContainer');
                 
                 document.getElementById('kpi-total-calls').textContent = data.length;
-                const bookedCount = allAppointments.filter(a => a.status === 'BOOKED').length;
+                const bookedCount = allAppointments.filter(a => a.status === 'BOOKED' || a.status === 'COMPLETED').length;
                 const conversion = data.length > 0 ? Math.round((bookedCount / data.length) * 100) : 0;
                 document.getElementById('kpi-conversion').textContent = `${conversion}%`;
 
@@ -1364,10 +1382,21 @@ async def get_appointments_api(request):
         cur.execute("SELECT id, patient_name, patient_phone, appointment_date, appointment_time, status FROM appointments ORDER BY appointment_date DESC, appointment_time DESC")
         rows = cur.fetchall()
     
+    now = datetime.now()
     data = []
     for r in rows:
         aid, name, phone, dt, tm, status = r
         time_str = tm.strftime("%H:%M") if hasattr(tm, "strftime") else str(tm)[:5]
+        
+        # Dynamically treat past booked slots as COMPLETED
+        if status == 'BOOKED':
+            try:
+                appt_datetime = datetime.combine(dt, tm)
+                if appt_datetime < now:
+                    status = 'COMPLETED'
+            except Exception:
+                pass
+
         data.append({
             "id": aid,
             "name": name,
