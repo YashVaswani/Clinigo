@@ -76,16 +76,19 @@ def _normalize_text_for_speech(text: str) -> str:
     text = re.sub(r'\b[Rr][Ss]\.?\b', curr_word, text)
     text = re.sub(r'[₹]', f" {curr_word} ", text)
 
-    # 4. Format phone numbers (7 to 13 digits) into spaced digits
+    # 4. Format phone numbers (7 to 13 digits, with optional hyphens/spaces/+91) into comma-separated individual digits for crystal-clear recitation
     def format_phone(m):
-        digits = m.group(0)
-        if len(digits) == 10:
-            return " ".join(list(digits))
-        return " ".join(list(digits))
-    text = re.sub(r'\b\d{7,13}\b', format_phone, text)
+        raw_digits = re.sub(r'\D', '', m.group(0))
+        if len(raw_digits) >= 10:
+            d = raw_digits[-10:]
+            # Group into 5 and 5 with commas for natural cadence: '9, 8, 7, 6, 5,  4, 3, 2, 1, 0'
+            return ', '.join(list(d[:5])) + ',  ' + ', '.join(list(d[5:]))
+        return ', '.join(list(raw_digits))
+    phone_pattern = r'(?:\+?91[\s\-‑.]*)?(?:\b\d{3}[\s\-‑.]*\d{3}[\s\-‑.]*\d{4}\b|\b\d{5}[\s\-‑.]*\d{5}\b|\b\d{7,13}\b)'
+    text = re.sub(phone_pattern, format_phone, text)
 
     # 5. Phonetic pronunciation enhancements for Cartesia TTS
-    text = re.sub(r'\bGunjan\b', 'Goonjan', text)
+    text = re.sub(r'\bGunjan\b', 'Gunjan', text)
 
     return text.strip()
 
@@ -154,24 +157,22 @@ async def precompute_greeting():
             "Content-Type": "application/json"
         }
         c_payload = {
-            "model_id": "sonic-turbo",
+            "model_id": "sonic-2",
             "transcript": greeting_text,
             "language": "en",
             "voice": {
                 "mode": "id",
-                "id": config.CARTESIA_VOICE_ID or "c6bbc7d5-4b35-4d49-b1c6-4417019a61c1",
-                "__experimental_controls": {"speed": 0.85}
+                "id": config.CARTESIA_VOICE_ID or "c6bbc7d5-4b35-4d49-b1c6-4417019a61c1"
             },
             "output_format": {
                 "container": "raw",
                 "encoding": "pcm_s16le",
-                "sample_rate": 16000
+                "sample_rate": 8000
             }
         }
         async with session.post(cartesia_url, headers=c_headers, json=c_payload) as resp:
             if resp.status == 200:
-                pcm_16k = await resp.read()
-                raw_8k, _ = audioop.ratecv(pcm_16k, 2, 1, 16000, 8000, None)
+                raw_8k = await resp.read()
                 GREETING_PCM_8K = _clean_audio_tail(raw_8k, fade_ms=40, sample_rate=8000)
                 logger.info(f"Pre-rendered initial greeting audio in memory ({len(GREETING_PCM_8K)} bytes at 8kHz).")
             else:
@@ -181,41 +182,68 @@ async def precompute_greeting():
         logger.exception("Failed to pre-render greeting")
 
 
-async def transcribe_audio_via_cartesia(pcm_bytes: bytes) -> str:
-    """Transcribes PCM audio using Cartesia Ink-Whisper multilingual streaming STT."""
-    from livekit.plugins import cartesia
-    from livekit.agents import utils
-    from livekit.agents.stt import SpeechEventType
-
-    if not config.CARTESIA_API_KEY or not pcm_bytes:
+async def transcribe_audio_via_groq(pcm_16k: bytes, api_key: str = None) -> str:
+    """Transcribes 16kHz PCM audio using Groq Whisper-large-v3-turbo (lightning fast + multi-lingual Hindi/English)."""
+    key = api_key or config.GROQ_API_KEY
+    if not key or not pcm_16k:
         return ""
 
     try:
-        # Upsample 8kHz telephony PCM -> 16kHz for Cartesia STT
-        pcm_16k, _ = audioop.ratecv(pcm_bytes, 2, 1, 8000, 16000, None)
+        session = await get_http_session()
+        wav_bytes = pcm_to_wav(pcm_16k, sample_rate=16000)
 
+        url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {key}"}
+
+        data = aiohttp.FormData()
+        data.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
+        data.add_field("model", "whisper-large-v3-turbo")
+        data.add_field("prompt", "Doctor consultation, Hindi and English conversation.")
+        data.add_field("temperature", "0.0")
+
+        async with session.post(url, headers=headers, data=data) as resp:
+            if resp.status == 200:
+                result = await resp.json()
+                text = result.get("text", "").strip()
+                if text:
+                    logger.info(f"Groq Whisper ASR Recognized: {text}")
+                return text
+            else:
+                err = await resp.text()
+                logger.warning(f"Groq Whisper ASR failed ({resp.status}): {err}")
+                return ""
+    except Exception as e:
+        logger.error(f"Error in Groq Whisper ASR: {e}")
+        return ""
+
+
+async def transcribe_audio_via_cartesia(pcm_16k: bytes) -> str:
+    """Transcribes 16kHz PCM audio using Cartesia Ink-Whisper multilingual STT."""
+    from livekit.plugins import cartesia
+    from livekit.agents import utils
+
+    if not config.CARTESIA_API_KEY or not pcm_16k:
+        return ""
+
+    try:
         async with utils.http_context.open():
             stt_instance = cartesia.STT(
                 api_key=config.CARTESIA_API_KEY,
                 model='ink-whisper',
                 sample_rate=16000,
-                encoding='pcm_s16le'
+                encoding='pcm_s16le',
+                language=None  # Multilingual auto-detect (Hindi, Hinglish, English)
             )
             stream = stt_instance.stream()
             final_text = []
-            done_event = asyncio.Event()
 
             async def read_stream():
                 try:
                     async for event in stream:
                         if event.alternatives and event.alternatives[0].text:
                             final_text.append(event.alternatives[0].text)
-                        if getattr(event, 'type', None) in [SpeechEventType.FINAL_TRANSCRIPT, SpeechEventType.END_OF_SPEECH]:
-                            done_event.set()
                 except Exception:
                     pass
-                finally:
-                    done_event.set()
 
             reader_task = asyncio.create_task(read_stream())
 
@@ -230,17 +258,19 @@ async def transcribe_audio_via_cartesia(pcm_bytes: bytes) -> str:
                     samples_per_channel=len(chunk) // 2
                 )
                 stream.push_frame(frame)
-                await asyncio.sleep(0.002)
+                await asyncio.sleep(0.001)
 
             stream.end_input()
             try:
-                await asyncio.wait_for(done_event.wait(), timeout=0.8)
+                await asyncio.wait_for(reader_task, timeout=2.5)
             except asyncio.TimeoutError:
                 pass
             await stream.aclose()
-            reader_task.cancel()
 
-            return " ".join(dict.fromkeys(final_text)).strip()
+            result_text = " ".join(dict.fromkeys(final_text)).strip()
+            if result_text:
+                logger.info(f"Cartesia Ink-Whisper ASR Recognized: {result_text}")
+            return result_text
     except Exception as e:
         logger.error(f"Cartesia Ink-Whisper STT error: {e}")
         return ""
@@ -319,16 +349,16 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "cancel_appointment",
-            "description": "Cancel an existing appointment for a patient",
+            "description": "Cancel an existing appointment for a patient by their full name or phone number",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "patient_name": {"type": "string", "description": "Full name of the patient"},
-                    "patient_phone": {"type": "string", "description": "Phone number of the patient"},
-                    "appointment_date": {"type": "string", "description": "Date in YYYY-MM-DD format"},
+                    "patient_phone": {"type": "string", "description": "Phone number of the patient (optional if name is provided)"},
+                    "appointment_date": {"type": "string", "description": "Date in YYYY-MM-DD format (optional)"},
                     "appointment_time": {"type": "string", "description": "Time in HH:MM format (optional)"}
                 },
-                "required": ["patient_name", "patient_phone", "appointment_date"]
+                "required": []
             }
         }
     },
@@ -336,18 +366,18 @@ GROQ_TOOLS = [
         "type": "function",
         "function": {
             "name": "reschedule_appointment",
-            "description": "Reschedule an existing appointment to a new date and time",
+            "description": "Reschedule an existing appointment to a new date and time using patient name or phone",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "patient_name": {"type": "string", "description": "Full name of the patient"},
-                    "patient_phone": {"type": "string", "description": "Phone number of the patient"},
+                    "patient_phone": {"type": "string", "description": "Phone number of the patient (optional if name is provided)"},
                     "old_date": {"type": "string", "description": "Original appointment date in YYYY-MM-DD format"},
-                    "old_time": {"type": "string", "description": "Original appointment time in HH:MM format"},
+                    "old_time": {"type": "string", "description": "Original appointment time in HH:MM format (optional)"},
                     "new_date": {"type": "string", "description": "New appointment date in YYYY-MM-DD format"},
                     "new_time": {"type": "string", "description": "New appointment time in HH:MM format"}
                 },
-                "required": ["patient_name", "patient_phone", "old_date", "old_time", "new_date", "new_time"]
+                "required": ["new_date", "new_time"]
             }
         }
     },
@@ -568,6 +598,8 @@ class VoiceSession:
         self.active_turn_tasks = set()
         self.playout_task = None
         self.cancel_playback_flag = False
+        self.playout_start_time = None  # Tracks when current speech started (for grace period)
+        self.is_speaking = False        # True while TTS audio is playing — blocks echo from being fed to VAD
 
         # Booking state machine — tracks which step the booking is on
         # Prevents farewell from firing mid-booking on "thank you"
@@ -579,6 +611,25 @@ class VoiceSession:
             "phone": None,
             "confirmed": False    # True only after book_appointment succeeds
         }
+        # Format caller's incoming phone number if available
+        self.clean_caller_phone = None
+        if caller_phone:
+            is_valid, clean_p = appointments_db.normalize_indian_phone(caller_phone)
+            if is_valid:
+                self.clean_caller_phone = clean_p
+            else:
+                self.clean_caller_phone = re.sub(r'\D', '', str(caller_phone))
+
+        caller_num_text = f" (Caller ID: {self.clean_caller_phone})" if self.clean_caller_phone else ""
+        caller_phone_instruction = ""
+        if self.clean_caller_phone:
+            caller_phone_instruction = f"""
+- CALLER PHONE NUMBER DETECTED: The caller is calling from {self.clean_caller_phone}.
+  When you reach STEP 3 (collecting phone number), ask naturally:
+  "Should I register the appointment with the number you're calling from ({self.clean_caller_phone}), or would you like to use a different number?"
+  * If they say yes, same number, or confirm (e.g. "yes", "this one", "haan isi number pe"), immediately use {self.clean_caller_phone}.
+  * If they say no or give another number, use the new 10-digit number they speak.
+"""
 
         # LLM Context with clinic knowledge & booking instructions
         now = datetime.now()
@@ -607,9 +658,22 @@ APPOINTMENT WORKFLOW (5 steps, strictly in order)
 ════════════════════════════════════════
 1. STEP 1 — SLOT INQUIRY: If the caller wants to book, call get_available_slots for the target date. State the available slots naturally and ask which time they prefer.
 2. STEP 2 — COLLECT NAME: Once a time slot is chosen, ask for the patient's full name. DO NOT proceed to booking or ask for the phone number yet.
-3. STEP 3 — COLLECT PHONE: Once the name is provided, ask for their 10-digit mobile phone number.
+3. STEP 3 — COLLECT PHONE:{caller_num_text}
+   * If incoming caller number ({self.clean_caller_phone or "available"}) is detected:
+     Ask: "Should I register this appointment under the number you are calling from, or would you prefer a different mobile number?"
+     - If the caller agrees (says "yes", "this number", "same number", "haan isi pe"): Use {self.clean_caller_phone}.
+     - If the caller says "no" or provides a different number: Use the new 10-digit number they speak.
+   * If no caller number is detected: Ask for their 10-digit mobile phone number.
 4. STEP 4 — BOOK & CONFIRM: Call the book_appointment tool. Verbally confirm all registration details clearly (name, date, time, and registered mobile number).
 5. STEP 5 — WRAP UP: Ask if they need any further help. If they say no or thank you, respond with a warm farewell. The call will automatically end 1 second after you say your farewell.
+
+════════════════════════════════════════
+CANCELLATION & RESCHEDULING FLEXIBILITY:
+════════════════════════════════════════
+- Patients can identify and cancel or reschedule their appointment using EITHER their full name OR their phone number.
+- If a caller says they forgot their phone number, do not have it, or simply provides their name, ACCEPT THEIR NAME directly and call cancel_appointment or reschedule_appointment immediately using their patient_name. NEVER refuse cancellation or insist on a phone number if the patient's name is provided.
+{caller_phone_instruction}
+- SPEAKING TO DOCTOR: If caller asks to speak directly with Dr. Umang Chourasia (e.g. "mujhe doctor se baat karni hai", "I want to talk to doctor"), respond warmly: "Dr. Umang Chourasia is currently seeing patients in consultation. I can schedule a consultation slot for you right now so you can speak with him directly. Would you like to check available slots for today or tomorrow?"
 
 ════════════════════════════════════════
 DYNAMIC VOICE & CONVERSATION RULES
@@ -630,17 +694,14 @@ DYNAMIC VOICE & CONVERSATION RULES
         self.chat_ctx = llm.ChatContext()
         self.chat_ctx.add_message(role="system", content=system_prompt)
         if caller_phone:
-            logger.info(f"Incoming call detected from: {caller_phone}")
+            logger.info(f"Incoming call detected from: {caller_phone} (Clean: {self.clean_caller_phone})")
         self.started_at = datetime.now()
 
-        # Initialize Silero VAD for telephony-grade turn-taking
-        # - activation_threshold 0.65: trigger on speech, filter line clicks
-        # - min_silence_duration 1.0s: wait 1.0 seconds of silence to prevent cutting off callers
-        #   when they pause to read out phone numbers or name spellings.
+        # Initialize Silero VAD matching agent.py configuration (16kHz neural inference)
         self.vad = silero.VAD.load(
-            sample_rate=8000,
-            activation_threshold=0.65,
-            min_silence_duration=1.00
+            activation_threshold=0.60,
+            min_silence_duration=0.60,
+            prefix_padding_duration=0.30
         )
         self.vad_stream = self.vad.stream()
 
@@ -652,12 +713,12 @@ DYNAMIC VOICE & CONVERSATION RULES
         await asyncio.sleep(0.65)
 
         # Speak initial greeting
-        if GREETING_PCM_8K:
-            logger.info("Speaking: Hello! Welcome to Healthcare Clinic. I am Gunjan, how may I help you today?")
-            self.playout_task = asyncio.create_task(self._playout_pcm(GREETING_PCM_8K))
-        else:
-            greeting_text = f"Hello! Welcome to {config.CLINIC_NAME}. I am Gunjan, how may I help you today?"
-            self.playout_task = asyncio.create_task(self._playout_stream(greeting_text))
+        self.cancel_playback_flag = False
+        self.is_speaking = True
+        import time
+        self.playout_start_time = time.perf_counter()
+        greeting_text = f"Hello! Welcome to {config.CLINIC_NAME}. I am Gunjan, how may I help you today?"
+        self.playout_task = asyncio.create_task(self._playout_stream(greeting_text))
 
     async def _vad_reader(self):
         from livekit.agents.vad import VADEventType
@@ -670,7 +731,16 @@ DYNAMIC VOICE & CONVERSATION RULES
                     self.interrupt_playback()
                 elif event.type == VADEventType.END_OF_SPEECH:
                     logger.info("VAD: Caller stopped speaking. Transcribing utterance...")
-                    frame = event.frames[0]
+                    # Concatenate ALL 16kHz audio frames in the speech segment for full speech transcription
+                    speech_pcm = b"".join(f.data for f in event.frames)
+                    if not speech_pcm:
+                        continue
+                    frame = rtc.AudioFrame(
+                        data=speech_pcm,
+                        sample_rate=16000,
+                        num_channels=1,
+                        samples_per_channel=len(speech_pcm) // 2
+                    )
                     # Cancel any running turn — always answer the LATEST question
                     if self.turn_lock.locked():
                         logger.info("Cancelling previous turn to handle new speech.")
@@ -687,24 +757,35 @@ DYNAMIC VOICE & CONVERSATION RULES
             logger.error(f"Error in VAD reader loop: {e}", exc_info=True)
 
     def interrupt_playback(self):
+        """Stops assistant speech when caller speaks, ignoring initial line clicks/pops."""
+        import time
+        if self.playout_start_time is not None:
+            elapsed = time.perf_counter() - self.playout_start_time
+            # Ignore line clicks/pops that occur within the first 350ms of playback
+            if elapsed < 0.35:
+                return
         self.cancel_playback_flag = True
         if self.playout_task and not self.playout_task.done():
             self.playout_task.cancel()
 
     async def say(self, text: str):
-        self.interrupt_playback()
         self.cancel_playback_flag = False
-        self.playout_task = asyncio.create_task(self._playout_stream(text))
-        await self.playout_task
+        import time
+        self.playout_start_time = time.perf_counter()
+        self.is_speaking = True
+        try:
+            self.playout_task = asyncio.create_task(self._playout_stream(text))
+            await self.playout_task
+        finally:
+            self.is_speaking = False
 
-    async def _playout_pcm(self, raw_pcm: bytes):
-        """Immediately stream 8kHz PCM to WebSocket with wall-clock pacing."""
+    async def _playout_mulaw(self, mulaw_data: bytes):
+        """Stream native 8kHz mu-law audio to WebSocket with 100ms jitter buffer priming."""
         import time
         try:
-            if self.cancel_playback_flag or not raw_pcm:
+            if self.cancel_playback_flag or not mulaw_data:
                 return
-            mulaw_data = audioop.lin2ulaw(raw_pcm, 2)
-            chunk_size = 320
+            chunk_size = 640  # 640 bytes = 80ms audio chunk @ 8kHz mulaw
             start_pacing = time.perf_counter()
             packets_sent = 0
 
@@ -713,25 +794,23 @@ DYNAMIC VOICE & CONVERSATION RULES
                     break
                 audio_chunk = mulaw_data[i:i + chunk_size]
                 if len(audio_chunk) < chunk_size:
-                    pad_samples = (chunk_size - len(audio_chunk)) // 2
-                    silence_pad = audioop.lin2ulaw(b'\x00\x00' * pad_samples, 2) if pad_samples > 0 else b''
-                    audio_chunk = audio_chunk + silence_pad
+                    pad_bytes = chunk_size - len(audio_chunk)
+                    audio_chunk = audio_chunk + (b'\xff' * pad_bytes)  # 0xff is mu-law silence
 
                 payload_b64 = base64.b64encode(audio_chunk).decode("utf-8")
                 await self.websocket.send(json.dumps({
                     "event": "media",
                     "streamSid": self.stream_sid,
                     "media": {
-                        "payload": payload_b64,
-                        "chunk": str(self.chunk_counter)
+                        "payload": payload_b64
                     }
                 }))
-                self.chunk_counter += 1
                 packets_sent += 1
 
-                expected_time = start_pacing + (packets_sent * 0.04)
+                # Precise 80ms pacing (bypasses Windows timer lag and ngrok socket overhead)
+                expected_time = start_pacing + (packets_sent * 0.08)
                 sleep_duration = expected_time - time.perf_counter()
-                if sleep_duration > 0:
+                if sleep_duration > 0.005:
                     await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
             logger.info("Speech playout task interrupted by caller.")
@@ -741,13 +820,13 @@ DYNAMIC VOICE & CONVERSATION RULES
                 logger.error(f"Error in speech playout: {e}")
 
     async def _playout_stream(self, text: str):
-        """Synthesize speech via Cartesia Sonic-Turbo and stream mulaw audio to the WebSocket."""
+        """Synthesize native 8kHz mu-law speech via Cartesia and stream directly to WebSocket."""
         try:
             # Normalize text for speech (pronounce phone numbers and currencies cleanly)
             spoken_text = _normalize_text_for_speech(text)
             logger.info(f"Speaking: {text}")
 
-            raw_pcm = None
+            mulaw_bytes = None
             if config.CARTESIA_API_KEY:
                 try:
                     session = await get_http_session()
@@ -759,38 +838,33 @@ DYNAMIC VOICE & CONVERSATION RULES
                     }
                     is_hi = _detect_hindi(spoken_text)
                     c_payload = {
-                        "model_id": "sonic-turbo",
+                        "model_id": "sonic-2",
                         "transcript": spoken_text,
                         "language": "hi" if is_hi else "en",
                         "voice": {
                             "mode": "id",
-                            "id": config.CARTESIA_VOICE_ID or "c6bbc7d5-4b35-4d49-b1c6-4417019a61c1",
-                            "__experimental_controls": {
-                                "speed": 0.85  # Relaxed, natural, clear human conversation speed
-                            }
+                            "id": config.CARTESIA_VOICE_ID or "c6bbc7d5-4b35-4d49-b1c6-4417019a61c1"
                         },
                         "output_format": {
                             "container": "raw",
-                            "encoding": "pcm_s16le",
-                            "sample_rate": 16000
+                            "encoding": "pcm_mulaw",
+                            "sample_rate": 8000
                         }
                     }
                     async with session.post(cartesia_url, headers=c_headers, json=c_payload) as c_resp:
                         if c_resp.status == 200:
-                            pcm_16k = await c_resp.read()
-                            raw_8k, _ = audioop.ratecv(pcm_16k, 2, 1, 16000, 8000, None)
-                            raw_pcm = _clean_audio_tail(raw_8k, fade_ms=40, sample_rate=8000)
+                            mulaw_bytes = await c_resp.read()
                         else:
                             err = await c_resp.text()
                             logger.warning(f"Cartesia TTS error {c_resp.status}: {err}")
                 except Exception as c_err:
                     logger.warning(f"Cartesia TTS failed: {c_err}")
 
-            if not raw_pcm:
+            if not mulaw_bytes:
                 logger.error("No audio generated from Cartesia TTS.")
                 return
 
-            await self._playout_pcm(raw_pcm)
+            await self._playout_mulaw(mulaw_bytes)
 
         except asyncio.CancelledError:
             logger.info("Speech playout task interrupted by caller.")
@@ -808,8 +882,10 @@ DYNAMIC VOICE & CONVERSATION RULES
             return
         async with self.turn_lock:
             try:
-                # 1. Speech-to-Text Transcription via Cartesia Ink-Whisper
+                # 1. Speech-to-Text Transcription via Cartesia Ink-Whisper (with Groq backup)
                 user_text = await transcribe_audio_via_cartesia(audio_frame.data)
+                if not user_text and config.GROQ_API_KEY:
+                    user_text = await transcribe_audio_via_groq(audio_frame.data)
 
                 if not user_text or not user_text.strip():
                     logger.info("ASR: No speech recognized in utterance.")
@@ -842,6 +918,9 @@ DYNAMIC VOICE & CONVERSATION RULES
                 if full_response and not self.cancel_playback_flag:
                     self.chat_ctx.add_message(role="assistant", content=full_response)
 
+                    # Synthesize and stream the complete response as one fluid, continuous audio playout
+                    await self.say(full_response)
+
                     lower_resp = full_response.lower()
 
                     # Track booking confirmation: set confirmed=True when Gunjan speaks the booking confirmation
@@ -854,7 +933,6 @@ DYNAMIC VOICE & CONVERSATION RULES
                         self.booking_state["active"] = True
 
                     # Detect caller's wrap-up intent from their INPUT text
-                    # Used to validate farewell is appropriate
                     caller_done_signals = [
                         "no", "nahi", "nothing", "nope", "that's all", "thats all",
                         "nothing else", "i'm good", "im good", "all good", "bas",
@@ -867,9 +945,6 @@ DYNAMIC VOICE & CONVERSATION RULES
                         any(clean_user == sig or clean_user.startswith(sig) for sig in caller_done_signals)
                     )
 
-                    # Synthesize and stream the complete response as one fluid, uninterrupted audio playback
-                    await self.say(full_response)
-
                     # Determine if this is a genuine farewell response
                     farewell_keywords = ["goodbye", "have a wonderful day", "have a great day", "take care and have",
                                          "take care. goodbye", "shubh din", "alvida", "it was my pleasure"]
@@ -881,8 +956,13 @@ DYNAMIC VOICE & CONVERSATION RULES
                     ) or caller_wants_to_end
 
                     if should_hangup:
-                        logger.info("Call wrap-up detected. Hanging up in 1 second...")
-                        await asyncio.sleep(1.0)
+                        logger.info("Call wrap-up detected. Waiting for farewell audio playout to finish...")
+                        if self.playout_task and not self.playout_task.done():
+                            try:
+                                await self.playout_task
+                            except Exception:
+                                pass
+                        await asyncio.sleep(1.2)  # Buffer so caller hears the complete farewell word
                         try:
                             await self.websocket.close()
                         except Exception:
@@ -968,20 +1048,24 @@ async def handler(websocket):
             if event == "connected":
                 logger.info("Tata Smartflo connection handshake completed.")
             elif event == "start":
-                stream_sid = data["streamSid"]
-                caller_phone = data["start"].get("from", "")
+                start_data = data.get("start", {})
+                stream_sid = data.get("streamSid") or start_data.get("streamSid") or "stream-1"
+                caller_phone = start_data.get("from") or start_data.get("caller") or ""
+                logger.info(f"Start event received. StreamSid: {stream_sid}, From: {caller_phone}")
                 session = VoiceSession(websocket, stream_sid, caller_phone)
                 await session.run()
             elif event == "media":
                 if session:
                     payload = base64.b64decode(data["media"]["payload"])
                     # Convert 8kHz µ-law payload to 8kHz 16-bit PCM
-                    pcm = audioop.ulaw2lin(payload, 2)
+                    pcm_8k = audioop.ulaw2lin(payload, 2)
+                    # Upsample 8kHz PCM -> 16kHz PCM for Silero VAD neural model
+                    pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
                     frame = rtc.AudioFrame(
-                        data=pcm,
-                        sample_rate=8000,
+                        data=pcm_16k,
+                        sample_rate=16000,
                         num_channels=1,
-                        samples_per_channel=len(pcm) // 2
+                        samples_per_channel=len(pcm_16k) // 2
                     )
                     session.vad_stream.push_frame(frame)
             elif event == "stop":
