@@ -1096,8 +1096,9 @@ async def main():
     # Pre-render initial greeting to eliminate startup greeting delay
     await precompute_greeting()
 
-    logger.info("Starting Tata Smartflo WebSocket Server on port 8080...")
-    async with websockets.serve(handler, "0.0.0.0", 8080):
+    port = int(os.getenv("PORT", "8081"))
+    logger.info(f"Starting Tata Smartflo WebSocket Server on port {port}...")
+    async with websockets.serve(handler, "0.0.0.0", port):
         await asyncio.Future()  # Keep running indefinitely
 
 
