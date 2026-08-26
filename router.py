@@ -14,7 +14,7 @@ logger = logging.getLogger("router")
 # CHOOSE YOUR ACTIVE AGENT (comment out the one you are not using)
 # =========================================================================
 ACTIVE_AGENT_URL = "ws://127.0.0.1:8081"   # Agent A - Clinigo (tata_voice_server.py)
-# ACTIVE_AGENT_URL = "ws://127.0.0.1:8082" # Agent B - Secondary / Other Agent
+# ACTIVE_AGENT_URL = "ws://10.133.208.41:8082" # Agent B - Secondary / Other Agent
 
 ROUTER_HOST = "0.0.0.0"
 ROUTER_PORT = 8080  # The single port ngrok exposes to Tata Smartflo
