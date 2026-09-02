@@ -31,10 +31,14 @@ async def proxy_stream(source_ws, target_ws, direction: str):
         logger.debug(f"Stream closed or error on {direction}: {e}")
 
 
+import audioop
+import base64
+import json
+
 async def handle_smartflo_connection(smartflo_ws):
     """Proxies inbound Tata Smartflo call to whichever AGENT is currently active."""
-    import json
     target_url = ACTIVE_AGENT_URL
+    is_exotel_agent = ("8082" in target_url) # Agent B uses Exotel Linear PCM
     logger.info(f"Incoming call from Smartflo. Routing to active agent -> {target_url}")
 
     session_state = {"real_stream_sid": None}
@@ -46,6 +50,7 @@ async def handle_smartflo_connection(smartflo_ws):
             async def smartflo_to_agent_proxy():
                 try:
                     async for message in smartflo_ws:
+                        out_message = message
                         if isinstance(message, str):
                             try:
                                 data = json.loads(message)
@@ -55,9 +60,17 @@ async def handle_smartflo_connection(smartflo_ws):
                                     if sid:
                                         session_state["real_stream_sid"] = sid
                                         logger.info(f"Captured Tata Smartflo real streamSid: {sid}")
+                                elif data.get("event") == "media" and is_exotel_agent:
+                                    # Convert Tata Smartflo 8kHz mulaw -> 8kHz 16-bit Linear PCM for Exotel
+                                    raw_mulaw = base64.b64decode(data["media"]["payload"])
+                                    pcm16 = audioop.ulaw2lin(raw_mulaw, 2)
+                                    data["media"]["payload"] = base64.b64encode(pcm16).decode("ascii")
+                                    if "streamSid" in data:
+                                        data["stream_sid"] = data["streamSid"]
+                                    out_message = json.dumps(data)
                             except Exception:
                                 pass
-                        await agent_ws.send(message)
+                        await agent_ws.send(out_message)
                 except websockets.exceptions.ConnectionClosed:
                     pass
                 except Exception as e:
@@ -71,10 +84,16 @@ async def handle_smartflo_connection(smartflo_ws):
                             try:
                                 data = json.loads(message)
                                 if data.get("event") == "media":
-                                    # Adapt streamSid to match Tata Smartflo carrier expectations
                                     data["streamSid"] = session_state["real_stream_sid"]
                                     if "stream_sid" in data:
                                         del data["stream_sid"]
+
+                                    if is_exotel_agent:
+                                        # Convert Agent B's 8kHz 16-bit Linear PCM -> 8kHz mulaw for Tata Smartflo
+                                        raw_pcm16 = base64.b64decode(data["media"]["payload"])
+                                        mulaw = audioop.lin2ulaw(raw_pcm16, 2)
+                                        data["media"]["payload"] = base64.b64encode(mulaw).decode("ascii")
+
                                     out_message = json.dumps(data)
                             except Exception:
                                 pass
