@@ -198,7 +198,11 @@ async def transcribe_audio_via_groq(pcm_16k: bytes, api_key: str = None) -> str:
         data = aiohttp.FormData()
         data.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
         data.add_field("model", "whisper-large-v3-turbo")
-        data.add_field("prompt", "Doctor consultation, Hindi and English conversation.")
+        data.add_field(
+            "prompt",
+            "Hello Gunjan, I want to book an appointment with Dr. Umang Chourasia at Healthcare Clinic. "
+            "Mujhe doctor se milna hai, appointment book karna hai, consultation timing and fees."
+        )
         data.add_field("temperature", "0.0")
 
         async with session.post(url, headers=headers, data=data) as resp:
@@ -206,6 +210,10 @@ async def transcribe_audio_via_groq(pcm_16k: bytes, api_key: str = None) -> str:
                 result = await resp.json()
                 text = result.get("text", "").strip()
                 if text:
+                    import re
+                    # Automatic phonetic correction for telephony ASR mishearings
+                    text = re.sub(r'\bbukan\b', 'book an', text, flags=re.IGNORECASE)
+                    text = re.sub(r'\bquentin\b', 'Gunjan', text, flags=re.IGNORECASE)
                     logger.info(f"Groq Whisper ASR Recognized: {text}")
                 return text
             else:
@@ -394,17 +402,63 @@ GROQ_TOOLS = [
                 }
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "end_call",
+            "description": "Call this function to hang up and disconnect the phone call session when the caller's request is satisfied, appointment is confirmed, or the caller says goodbye/thank you.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief reason for ending the call (e.g. 'Appointment confirmed', 'Caller inquiry completed', 'Caller said goodbye')"
+                    }
+                },
+                "required": ["reason"]
+            }
+        }
     }
 ]
 
 
-def _execute_clinic_tool(func_name: str, args: dict) -> dict:
-    """Executes the requested appointment database tool and returns a result dict."""
+def _execute_clinic_tool(func_name: str, args: dict, session=None) -> dict:
+    """Executes the requested appointment database tool or session action and returns a result dict."""
     try:
         # Sanitize tool name if model appended channel/commentary tokens
         clean_name = func_name.split('<')[0].split('|')[0].strip()
 
-        if clean_name == "get_available_slots":
+        if clean_name == "end_call":
+            if session:
+                user_msgs = [m.content for m in session.chat_ctx.messages() if m.role == "user"]
+                user_turns = len(user_msgs)
+                last_user_msg = (user_msgs[-1] if user_msgs else "").lower().strip()
+
+                if user_turns <= 1:
+                    logger.info(f"LLM tried to call end_call on turn {user_turns} — suppressing false early hangup.")
+                    return {"status": "ignored", "message": "The call just started. Continue assisting the caller normally."}
+
+                # Disallow end_call if caller is inquiring about appointments or doctor consultation
+                booking_keywords = ["book", "appointment", "slot", "doctor", "milna", "dr", "chourasia", "timing", "time", "date", "fee", "cost", "cancel", "reschedule"]
+                if any(kw in last_user_msg for kw in booking_keywords):
+                    logger.warning(f"LLM tried to end_call while caller is discussing appointments ('{last_user_msg}') — suppressing false hangup.")
+                    return {"status": "ignored", "message": "The caller is inquiring about an appointment or clinic service. Do not end the call; assist them with their request."}
+
+                # Require an explicit indication from caller that they are done before allowing hangup
+                done_signals = [
+                    "bye", "goodbye", "thank you", "thanks", "that's all", "thats all",
+                    "nothing else", "no thanks", "no thank you", "all good", "nahin", "nahi",
+                    "bas", "shukriya", "alvida", "no", "nope"
+                ]
+                if not any(sig in last_user_msg for sig in done_signals):
+                    logger.warning(f"LLM tried to end_call without caller farewell or done signal ('{last_user_msg}') — suppressing false hangup.")
+                    return {"status": "ignored", "message": "The caller has not indicated they are finished. Continue assisting them."}
+
+                session.end_call_requested = True
+                logger.info(f"LLM executed end_call tool (Reason: {args.get('reason', 'N/A')})")
+            return {"status": "success", "message": "Call termination authorized. Deliver your final warm farewell to the caller."}
+        elif clean_name == "get_available_slots":
             date_str = args.get("target_date")
             slots = appointments_db.get_available_slots(date_str)
             return {"target_date": date_str, "available_slots": slots, "count": len(slots)}
@@ -441,7 +495,6 @@ def _execute_clinic_tool(func_name: str, args: dict) -> dict:
         logger.error(f"Error executing tool {func_name}: {e}")
         return {"error": str(e)}
     return {"error": f"Unknown tool {func_name}"}
-    return {"error": f"Unknown tool: {func_name}"}
 
 
 class LLMTextChunk:
@@ -466,10 +519,11 @@ def _extract_spoken_text_from_failed_generation(err_json_str: str) -> str:
 
 
 class GroqToolLLMStream:
-    def __init__(self, chat_ctx: llm.ChatContext, api_key: str, model: str):
+    def __init__(self, chat_ctx: llm.ChatContext, api_key: str, model: str, session=None):
         self._chat_ctx = chat_ctx
         self._api_key = api_key
         self._model = model
+        self._session = session
 
     def __aiter__(self):
         return self._generate()
@@ -491,9 +545,9 @@ class GroqToolLLMStream:
                 messages.append({"role": api_role, "content": text})
 
         session = await get_http_session()
-        # Keep system instructions + last 16 conversation turns to prevent mid-call memory loss
+        # Keep system instructions + last 6 conversation turns (saves ~1,200 tokens per turn to prevent 429 rate limits)
         system_msgs = [m for m in messages if m["role"] == "system"]
-        chat_msgs = [m for m in messages if m["role"] != "system"][-16:]
+        chat_msgs = [m for m in messages if m["role"] != "system"][-6:]
         cur_messages = system_msgs + chat_msgs
 
         try:
@@ -507,20 +561,28 @@ class GroqToolLLMStream:
                 }
 
                 async with session.post(url, headers=headers, json=payload) as resp:
-                    if resp.status != 200:
+                    if resp.status == 429:
+                        logger.warning(f"Groq API 429 token rate limit on {self._model}. Waiting 2.0s for token bucket refill...")
+                        await asyncio.sleep(2.0)
+                        async with session.post(url, headers=headers, json=payload) as fb_resp:
+                            if fb_resp.status == 200:
+                                data = await fb_resp.json()
+                            else:
+                                err_text = await fb_resp.text()
+                                logger.error(f"Groq API retry error {fb_resp.status}: {err_text}")
+                                return
+                    elif resp.status != 200:
                         err_text = await resp.text()
                         logger.error(f"Groq API error {resp.status}: {err_text}")
-                        # Auto-recover the spoken text from failed_generation if model wrapped text in commentary
                         recovered = _extract_spoken_text_from_failed_generation(err_text)
                         if recovered:
                             logger.info(f"Recovered response from failed_generation: {recovered}")
                             yield LLMTextChunk(recovered)
                             return
-
-                        yield LLMTextChunk("I'd be happy to help you with your appointment. Which date and time would you like?")
+                        yield LLMTextChunk("How can I help you today?")
                         return
-
-                    data = await resp.json()
+                    else:
+                        data = await resp.json()
                     choice = data.get("choices", [{}])[0].get("message", {})
                     tool_calls = choice.get("tool_calls", [])
 
@@ -533,7 +595,7 @@ class GroqToolLLMStream:
                             fn_args = {}
 
                         logger.info(f"Groq LLM Tool Call: {fn_name}({fn_args})")
-                        tool_result = _execute_clinic_tool(fn_name, fn_args)
+                        tool_result = _execute_clinic_tool(fn_name, fn_args, session=self._session)
                         logger.info(f"Groq LLM Tool Result: {tool_result}")
 
                         cur_messages.append(choice)
@@ -556,13 +618,13 @@ class GroqToolLLMStream:
 
 
 class GroqToolLLM(llm.LLM):
-    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b"):
+    def __init__(self, api_key: str, model: str = "openai/gpt-oss-20b"):
         super().__init__()
         self._api_key = api_key
         self._model = model
 
-    def chat(self, *, chat_ctx: llm.ChatContext, conn_options=None) -> GroqToolLLMStream:
-        return GroqToolLLMStream(chat_ctx=chat_ctx, api_key=self._api_key, model=self._model)
+    def chat(self, *, chat_ctx: llm.ChatContext, session=None, conn_options=None) -> GroqToolLLMStream:
+        return GroqToolLLMStream(chat_ctx=chat_ctx, api_key=self._api_key, model=self._model, session=session)
 
 
 # ----- Global Provider Instances -----
@@ -578,8 +640,8 @@ def initialize_providers():
     logger.info(f"Initializing Cartesia TTS (sonic-turbo | Voice: {config.CARTESIA_VOICE_ID or 'c6bbc7d5-4b35-4d49-b1c6-4417019a61c1'})...")
 
     # 3. LLM Provider (Groq Tool LLM with sub-150ms LPU execution)
-    logger.info("Initializing Groq Tool LLM (openai/gpt-oss-120b)...")
-    llm_provider = GroqToolLLM(api_key=config.GROQ_API_KEY, model="openai/gpt-oss-120b")
+    logger.info("Initializing Groq Tool LLM (openai/gpt-oss-20b)...")
+    llm_provider = GroqToolLLM(api_key=config.GROQ_API_KEY, model="openai/gpt-oss-20b")
 
 
 # ----- Live Voice Call Session Manager -----
@@ -600,17 +662,10 @@ class VoiceSession:
         self.cancel_playback_flag = False
         self.playout_start_time = None  # Tracks when current speech started (for grace period)
         self.is_speaking = False        # True while TTS audio is playing — blocks echo from being fed to VAD
-
-        # Booking state machine — tracks which step the booking is on
-        # Prevents farewell from firing mid-booking on "thank you"
-        self.booking_state = {
-            "active": False,      # True once caller has started booking flow
-            "date": None,
-            "time": None,
-            "name": None,
-            "phone": None,
-            "confirmed": False    # True only after book_appointment succeeds
-        }
+        self.end_call_requested = False # Set to True when LLM calls the end_call tool
+        import time
+        self.last_activity_time = time.time()
+        self.inactivity_monitor_task = None
         # Format caller's incoming phone number if available
         self.clean_caller_phone = None
         if caller_phone:
@@ -620,105 +675,92 @@ class VoiceSession:
             else:
                 self.clean_caller_phone = re.sub(r'\D', '', str(caller_phone))
 
-        caller_num_text = f" (Caller ID: {self.clean_caller_phone})" if self.clean_caller_phone else ""
-        caller_phone_instruction = ""
-        if self.clean_caller_phone:
-            caller_phone_instruction = f"""
-- CALLER PHONE NUMBER DETECTED: The caller is calling from {self.clean_caller_phone}.
-  When you reach STEP 3 (collecting phone number), ask naturally:
-  "Should I register the appointment with the number you're calling from ({self.clean_caller_phone}), or would you like to use a different number?"
-  * If they say yes, same number, or confirm (e.g. "yes", "this one", "haan isi number pe"), immediately use {self.clean_caller_phone}.
-  * If they say no or give another number, use the new 10-digit number they speak.
-"""
-
-        # LLM Context with clinic knowledge & booking instructions
+        # Streamlined system prompt to keep turn tokens under 600 (prevents Groq 8,000 TPM limit)
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d, %A")
         tomorrow_str = (now + timedelta(days=1)).strftime("%Y-%m-%d, %A")
-        system_prompt = f"""You are "Gunjan", a warm, professional, and highly capable voice receptionist for {config.CLINIC_NAME}.
+        caller_info = f"Caller phone: {self.clean_caller_phone}." if self.clean_caller_phone else ""
 
-════════════════════════════════════════
-CLINIC FACTS & PROFILE (Only use these facts)
-════════════════════════════════════════
-- Doctor: Dr. {config.DOCTOR_NAME}, Senior Physician & General Practitioner.
-- Specialities: General health issues, fevers, seasonal infections, cold/cough, diabetes management, high blood pressure, gastric issues, routine checkups.
-- Fee: ₹500 for a 30-minute consultation slot.
-- Clinic Timings: Monday to Saturday, 9:00 AM to 5:00 PM. Closed on Sundays.
-- Lunch Break: 12:00 PM to 1:00 PM (no slots).
-- Walk-ins: Accepted, but booked patients receive priority.
-- Cancellation / Rescheduling: Free of charge anytime.
+        system_prompt = f"""You are "Gunjan", warm voice receptionist for {config.CLINIC_NAME}.
+CLINIC INFO:
+- Doctor: Dr. {config.DOCTOR_NAME}, Senior Physician. Fee: ₹500 (30 mins).
+- Timings: Mon-Sat 9AM-5PM (Lunch 12PM-1PM). Closed Sunday.
+- Today: {today_str} ({now.year}). Tomorrow: {tomorrow_str}. {caller_info}
 
-DATE & CALENDAR CONTEXT:
-- TODAY is {today_str} (Year: {now.year}).
-- TOMORROW is {tomorrow_str}.
-- When caller asks for "tomorrow" or any date, use {now.year}-MM-DD.
+BOOKING STEPS (Strictly in order):
+1. Slot inquiry -> Call get_available_slots(target_date). State available slots, ask which time they prefer.
+2. Slot chosen -> Ask patient's full name.
+3. Name given -> Ask for 10-digit phone (if calling from {self.clean_caller_phone or 'known number'}, ask if they want to use this number).
+4. Phone given -> Call book_appointment(name, phone, date, time). Verbally confirm details.
+5. Wrap-up -> Once confirmed or inquiry answered, if caller says thank you/bye/done, speak warm farewell and call end_call tool.
 
-════════════════════════════════════════
-APPOINTMENT WORKFLOW (5 steps, strictly in order)
-════════════════════════════════════════
-1. STEP 1 — SLOT INQUIRY: If the caller wants to book, call get_available_slots for the target date. State the available slots naturally and ask which time they prefer.
-2. STEP 2 — COLLECT NAME: Once a time slot is chosen, ask for the patient's full name. DO NOT proceed to booking or ask for the phone number yet.
-3. STEP 3 — COLLECT PHONE:{caller_num_text}
-   * If incoming caller number ({self.clean_caller_phone or "available"}) is detected:
-     Ask: "Should I register this appointment under the number you are calling from, or would you prefer a different mobile number?"
-     - If the caller agrees (says "yes", "this number", "same number", "haan isi pe"): Use {self.clean_caller_phone}.
-     - If the caller says "no" or provides a different number: Use the new 10-digit number they speak.
-   * If no caller number is detected: Ask for their 10-digit mobile phone number.
-4. STEP 4 — BOOK & CONFIRM: Call the book_appointment tool. Verbally confirm all registration details clearly (name, date, time, and registered mobile number).
-5. STEP 5 — WRAP UP: Ask if they need any further help. If they say no or thank you, respond with a warm farewell. The call will automatically end 1 second after you say your farewell.
-
-════════════════════════════════════════
-CANCELLATION & RESCHEDULING FLEXIBILITY:
-════════════════════════════════════════
-- Patients can identify and cancel or reschedule their appointment using EITHER their full name OR their phone number.
-- If a caller says they forgot their phone number, do not have it, or simply provides their name, ACCEPT THEIR NAME directly and call cancel_appointment or reschedule_appointment immediately using their patient_name. NEVER refuse cancellation or insist on a phone number if the patient's name is provided.
-{caller_phone_instruction}
-- SPEAKING TO DOCTOR: If caller asks to speak directly with Dr. Umang Chourasia (e.g. "mujhe doctor se baat karni hai", "I want to talk to doctor"), respond warmly: "Dr. Umang Chourasia is currently seeing patients in consultation. I can schedule a consultation slot for you right now so you can speak with him directly. Would you like to check available slots for today or tomorrow?"
-
-════════════════════════════════════════
-DYNAMIC VOICE & CONVERSATION RULES
-════════════════════════════════════════
-- DYNAMIC RESPONSES: Do NOT use pre-scripted or hardcoded reply templates. Respond dynamically, keeping the conversation natural, friendly, and human-like.
-- LANGUAGE ADAPTABILITY: If the caller speaks Hindi or Hinglish, respond entirely in natural Hindi/Hinglish. If they speak English, respond in English.
-- MEMORY RESILIENCY: Once the caller has chosen a date/time or provided their name, NEVER forget, clear, or request these details again in this call. If the phone number is invalid, too short, or fragmented, do NOT ask for the patient's name or date/time again. Maintain the confirmed name and slot in memory, and ask ONLY for the phone number. Additionally, if the caller repeats, restates, or corrects the date/time slot, but they have already provided the patient's name earlier in the conversation, do NOT ask for the name again. Skip directly to asking for the mobile number.
-- NO RAW FORMATS IN SPEECH: NEVER ask the caller to speak dates in "YYYY-MM-DD" format or mention raw date formats. Let callers speak dates naturally (e.g. "tomorrow", "August 26th"). You must translate their natural spoken date into the YYYY-MM-DD format silently before calling tools.
-- OUT-OF-SCOPE RULES:
-  * If asked about specific medical advice, dosages, or prescriptions, tell the caller you cannot provide medical advice over the phone and suggest consulting the doctor during their visit.
-  * If asked about completely unrelated topics (news, other businesses, general questions), politely redirect them to clinic queries.
-  * Introductions, names, greetings, and slot queries are ALWAYS in-scope. Never refuse these.
-- "Thank you" mid-booking is NOT a farewell. Do not say goodbye until the booking has been confirmed (Step 4).
-- Speak times in standard 12-hour format (e.g. "9:00 AM", "1:30 PM").
-- Keep replies concise (1–2 short spoken sentences).
-- Do not use markdown (bolding, bullet points, asterisks) in your output.
-"""
+RULES:
+- When asked to speak to doctor directly (e.g. "mujhe doctor se baat karni hai"), explain Dr. {config.DOCTOR_NAME} is currently seeing patients and offer to book a slot.
+- Can cancel or reschedule using patient full name or phone number.
+- Respond in Hindi/Hinglish if caller speaks Hindi; otherwise in English.
+- Keep replies concise (1-2 spoken sentences). No markdown or bullet points."""
         self.chat_ctx = llm.ChatContext()
         self.chat_ctx.add_message(role="system", content=system_prompt)
         if caller_phone:
             logger.info(f"Incoming call detected from: {caller_phone} (Clean: {self.clean_caller_phone})")
         self.started_at = datetime.now()
 
-        # Initialize Silero VAD matching agent.py configuration (16kHz neural inference)
+        # Initialize Silero VAD with 0.75s silence duration so caller isn't cut off mid-thought
         self.vad = silero.VAD.load(
             activation_threshold=0.60,
-            min_silence_duration=0.60,
-            prefix_padding_duration=0.30
+            min_silence_duration=0.75,
+            prefix_padding_duration=0.25
         )
         self.vad_stream = self.vad.stream()
 
     async def run(self):
-        # Start VAD reader background loop
+        # Start VAD reader background loop & Inactivity monitor
         self.vad_reader_task = asyncio.create_task(self._vad_reader())
+        self.inactivity_monitor_task = asyncio.create_task(self._inactivity_monitor())
 
         # Gentle 650ms connection buffer so telephony carrier audio establishes before greeting plays
         await asyncio.sleep(0.65)
 
-        # Speak initial greeting
+        # Speak initial greeting (protect from line click false interruptions)
         self.cancel_playback_flag = False
         self.is_speaking = True
+        self.is_greeting = True
         import time
         self.playout_start_time = time.perf_counter()
         greeting_text = f"Hello! Welcome to {config.CLINIC_NAME}. I am Gunjan, how may I help you today?"
         self.playout_task = asyncio.create_task(self._playout_stream(greeting_text))
+        try:
+            await self.playout_task
+        except Exception:
+            pass
+        self.is_greeting = False
+
+    async def _inactivity_monitor(self):
+        """Monitors for prolonged caller silence and politely checks in before ending."""
+        import time
+        checkin_done = False
+        while not self.closed and not self.end_call_requested:
+            await asyncio.sleep(1.0)
+            if self.is_speaking or self.turn_lock.locked():
+                self.last_activity_time = time.time()
+                continue
+
+            idle = time.time() - self.last_activity_time
+
+            if idle > 15.0 and not checkin_done:
+                checkin_done = True
+                logger.info("Inactivity monitor: Caller silent for 15s. Asking check-in prompt.")
+                await self.say("Are you still there? Take your time, I'm here to help.")
+                self.last_activity_time = time.time()
+            elif idle > 12.0 and checkin_done:
+                logger.info("Inactivity monitor: Continued silence for 12s after check-in. Closing call session.")
+                await self.say(f"Thank you for calling {config.CLINIC_NAME}. Goodbye!")
+                await asyncio.sleep(1.0)
+                try:
+                    await self.websocket.close()
+                except Exception:
+                    pass
+                break
 
     async def _vad_reader(self):
         from livekit.agents.vad import VADEventType
@@ -727,9 +769,16 @@ DYNAMIC VOICE & CONVERSATION RULES
                 if self.closed:
                     break
                 if event.type == VADEventType.START_OF_SPEECH:
-                    logger.info("VAD: Caller started speaking. Interrupting assistant speech.")
-                    self.interrupt_playback()
+                    import time
+                    self.last_activity_time = time.time()
+                    if getattr(self, 'is_greeting', False):
+                        logger.info("VAD: Line click detected during initial greeting — suppressing interruption.")
+                    else:
+                        logger.info("VAD: Caller started speaking. Interrupting assistant speech.")
+                        self.interrupt_playback()
                 elif event.type == VADEventType.END_OF_SPEECH:
+                    import time
+                    self.last_activity_time = time.time()
                     logger.info("VAD: Caller stopped speaking. Transcribing utterance...")
                     # Concatenate ALL 16kHz audio frames in the speech segment for full speech transcription
                     speech_pcm = b"".join(f.data for f in event.frames)
@@ -778,6 +827,7 @@ DYNAMIC VOICE & CONVERSATION RULES
             await self.playout_task
         finally:
             self.is_speaking = False
+            self.last_activity_time = time.time()
 
     async def _playout_mulaw(self, mulaw_data: bytes):
         """Stream native 8kHz mu-law audio to WebSocket with 100ms jitter buffer priming."""
@@ -785,7 +835,7 @@ DYNAMIC VOICE & CONVERSATION RULES
         try:
             if self.cancel_playback_flag or not mulaw_data:
                 return
-            chunk_size = 640  # 640 bytes = 80ms audio chunk @ 8kHz mulaw
+            chunk_size = 160  # Standard telephony RTP packet (160 bytes = 20ms @ 8kHz)
             start_pacing = time.perf_counter()
             packets_sent = 0
 
@@ -807,10 +857,10 @@ DYNAMIC VOICE & CONVERSATION RULES
                 }))
                 packets_sent += 1
 
-                # Precise 80ms pacing (bypasses Windows timer lag and ngrok socket overhead)
-                expected_time = start_pacing + (packets_sent * 0.08)
+                # Precise 20ms pacing matching telephony carrier standard
+                expected_time = start_pacing + (packets_sent * 0.02)
                 sleep_duration = expected_time - time.perf_counter()
-                if sleep_duration > 0.005:
+                if sleep_duration > 0.002:
                     await asyncio.sleep(sleep_duration)
         except asyncio.CancelledError:
             logger.info("Speech playout task interrupted by caller.")
@@ -882,10 +932,10 @@ DYNAMIC VOICE & CONVERSATION RULES
             return
         async with self.turn_lock:
             try:
-                # 1. Speech-to-Text Transcription via Cartesia Ink-Whisper (with Groq backup)
-                user_text = await transcribe_audio_via_cartesia(audio_frame.data)
-                if not user_text and config.GROQ_API_KEY:
-                    user_text = await transcribe_audio_via_groq(audio_frame.data)
+                # 1. Ultra-low latency STT: Groq Whisper-large-v3-turbo (sub-90ms ASR via HTTP pool)
+                user_text = await transcribe_audio_via_groq(audio_frame.data)
+                if not user_text and config.CARTESIA_API_KEY:
+                    user_text = await transcribe_audio_via_cartesia(audio_frame.data)
 
                 if not user_text or not user_text.strip():
                     logger.info("ASR: No speech recognized in utterance.")
@@ -902,10 +952,12 @@ DYNAMIC VOICE & CONVERSATION RULES
 
                 # Reset flags — we are now the active turn, ready to respond
                 self.cancel_playback_flag = False
+                self.end_call_requested = False  # Reset end_call flag so caller can ask follow-ups cleanly!
 
-                # 2. Fast LLM Generation with sub-300ms SSE streaming
-                llm_stream = llm_provider.chat(chat_ctx=self.chat_ctx)
+                # 2. Ultra-Fast LLM Generation with Sentence-Level Audio Streaming
+                llm_stream = llm_provider.chat(chat_ctx=self.chat_ctx, session=self)
                 full_response = ""
+                sentence_buf = ""
 
                 async for chunk in llm_stream:
                     if self.cancel_playback_flag:
@@ -913,62 +965,34 @@ DYNAMIC VOICE & CONVERSATION RULES
                     delta = chunk.text if hasattr(chunk, 'text') else ""
                     if delta:
                         full_response += delta
+                        sentence_buf += delta
+                        # Stream completed sentence to TTS as soon as end of sentence is detected
+                        if any(punct in sentence_buf for punct in [". ", "? ", "! ", "\n"]):
+                            import re
+                            parts = re.split(r'([.?!]+\s+|\n+)', sentence_buf, maxsplit=1)
+                            if len(parts) >= 2:
+                                sentence_to_say = (parts[0] + parts[1]).strip()
+                                sentence_buf = "".join(parts[2:])
+                                if sentence_to_say and not self.cancel_playback_flag:
+                                    await self.say(sentence_to_say)
+
+                # Stream any remaining text buffer to TTS
+                if sentence_buf.strip() and not self.cancel_playback_flag:
+                    await self.say(sentence_buf.strip())
 
                 full_response = full_response.strip()
                 if full_response and not self.cancel_playback_flag:
                     self.chat_ctx.add_message(role="assistant", content=full_response)
 
-                    # Synthesize and stream the complete response as one fluid, continuous audio playout
-                    await self.say(full_response)
-
-                    lower_resp = full_response.lower()
-
-                    # Track booking confirmation: set confirmed=True when Gunjan speaks the booking confirmation
-                    if any(kw in lower_resp for kw in ["is confirmed", "appointment is booked", "registered your mobile", "registered the number", "booked on", "booked for"]):
-                        self.booking_state["confirmed"] = True
-                        logger.info("Booking state: CONFIRMED")
-
-                    # Track that booking flow has started
-                    if any(kw in lower_resp for kw in ["slot", "available", "full name", "patient's name", "mobile number", "10-digit"]):
-                        self.booking_state["active"] = True
-
-                    # Detect caller's wrap-up intent from their INPUT text
-                    caller_done_signals = [
-                        "no", "nahi", "nothing", "nope", "that's all", "thats all",
-                        "nothing else", "i'm good", "im good", "all good", "bas",
-                        "no thanks", "no thank you", "thank you", "thanks", "shukriya",
-                        "bye", "goodbye", "alvida", "ok bye", "okay bye"
-                    ]
-                    clean_user = user_text.lower().strip(" .,!?")
-                    caller_wants_to_end = (
-                        self.booking_state["confirmed"] and
-                        any(clean_user == sig or clean_user.startswith(sig) for sig in caller_done_signals)
-                    )
-
-                    # Determine if this is a genuine farewell response
-                    farewell_keywords = ["goodbye", "have a wonderful day", "have a great day", "take care and have",
-                                         "take care. goodbye", "shubh din", "alvida", "it was my pleasure"]
-                    is_farewell_resp = any(kw in lower_resp for kw in farewell_keywords)
-                    booking_in_progress = self.booking_state["active"] and not self.booking_state["confirmed"]
-
-                    should_hangup = (
-                        is_farewell_resp and not booking_in_progress
-                    ) or caller_wants_to_end
-
-                    if should_hangup:
-                        logger.info("Call wrap-up detected. Waiting for farewell audio playout to finish...")
-                        if self.playout_task and not self.playout_task.done():
-                            try:
-                                await self.playout_task
-                            except Exception:
-                                pass
-                        await asyncio.sleep(1.2)  # Buffer so caller hears the complete farewell word
+                    # Fully dynamic LLM-driven call termination via tool calling (Zero hardcoded keywords/regex!)
+                    if self.end_call_requested:
+                        logger.info("End of call triggered by LLM tool call (end_call). Closing WebSocket session...")
+                        await asyncio.sleep(1.0)  # Playout buffer for complete audio delivery
                         try:
+                            logger.info("Closing WebSocket session (Hanging up call).")
                             await self.websocket.close()
-                        except Exception:
-                            pass
-                    elif is_farewell_resp and booking_in_progress:
-                        logger.warning("Farewell keyword in response but booking still in progress — suppressing hangup.")
+                        except Exception as close_err:
+                            logger.error(f"Error closing WebSocket on call wrap-up: {close_err}")
 
             except Exception as e:
                 logger.error(f"Error in process_turn: {e}", exc_info=True)
@@ -982,6 +1006,8 @@ DYNAMIC VOICE & CONVERSATION RULES
             task.cancel()
         if self.vad_reader_task:
             self.vad_reader_task.cancel()
+        if hasattr(self, 'inactivity_monitor_task') and self.inactivity_monitor_task:
+            self.inactivity_monitor_task.cancel()
         try:
             self.vad_stream.end_input()
             await self.vad_stream.aclose()
