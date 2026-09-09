@@ -686,19 +686,33 @@ Language:
 
     @agent.on("user_speech_committed")
     def on_user_spoke(msg):
+        text = msg.content if hasattr(msg, 'content') else str(msg)
         transcript_messages.append({
             "time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "speaker": "Patient",
-            "text": msg.content
+            "text": text
         })
+        try:
+            asyncio.create_task(ctx.room.local_participant.publish_data(
+                _json.dumps({"type": "transcript", "role": "user", "text": text}).encode('utf-8')
+            ))
+        except Exception as e:
+            logger.warning(f"Error publishing user transcript: {e}")
 
     @agent.on("agent_speech_committed")
     def on_agent_spoke(msg):
+        text = msg.content if hasattr(msg, 'content') else str(msg)
         transcript_messages.append({
             "time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "speaker": "Agent",
-            "text": msg.content
+            "text": text
         })
+        try:
+            asyncio.create_task(ctx.room.local_participant.publish_data(
+                _json.dumps({"type": "transcript", "role": "agent", "text": text}).encode('utf-8')
+            ))
+        except Exception as e:
+            logger.warning(f"Error publishing agent transcript: {e}")
 
     async def _save_session_on_shutdown(reason: str = ""):
         """Called by LiveKit when the job shuts down — persists transcript to DB."""
@@ -755,9 +769,6 @@ Language:
 
     # Register shutdown callback — fires automatically when the call ends
     ctx.add_shutdown_callback(_save_session_on_shutdown)
-
-    # Initial agent greeting
-    await agent.say(f"Hello, thank you for calling {config.CLINIC_NAME}. I'm the digital receptionist for {config.DOCTOR_NAME}. How can I help you today?")
 
 
 if __name__ == "__main__":

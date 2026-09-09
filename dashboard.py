@@ -463,6 +463,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .modal-sub{font-size:0.8rem;color:var(--c-sub);margin-bottom:1.5rem}
         .form-row{margin-bottom:1rem}
         .form-label{display:block;font-size:0.78rem;font-weight:600;color:var(--c-sub);margin-bottom:0.35rem}
+        .custom-dropdown{position:relative;width:100%}
+        .cd-trigger{
+            width:100%;padding:0.65rem 0.85rem;
+            background:rgba(8,15,30,0.9);border:1px solid var(--c-border);
+            border-radius:var(--radius-sm);color:var(--c-text);
+            font-size:0.88rem;font-family:'Plus Jakarta Sans',sans-serif;
+            cursor:pointer;display:flex;align-items:center;justify-content:space-between;
+            transition:all 0.2s;
+        }
+        .cd-trigger:hover{border-color:var(--c-primary)}
+        .cd-arrow{font-size:0.75rem;color:var(--c-sub);transition:transform 0.2s}
+        .custom-dropdown.open .cd-arrow{transform:rotate(180deg)}
+        .cd-menu{
+            position:absolute;top:calc(100% + 4px);left:0;right:0;
+            background:#080f1e;border:1px solid var(--c-border-h);
+            border-radius:var(--radius-sm);box-shadow:0 10px 30px rgba(0,0,0,0.85);
+            max-height:180px;overflow-y:auto;z-index:10000;display:none;padding:0.25rem 0;
+        }
+        .custom-dropdown.open .cd-menu{display:block;animation:fadeSlide 0.15s ease-out}
+        .cd-option{
+            padding:0.6rem 0.85rem;font-size:0.88rem;color:#f1f5f9;
+            cursor:pointer;transition:background 0.15s;display:flex;align-items:center;justify-content:space-between;
+        }
+        .cd-option:hover{background:rgba(79,131,255,0.25);color:#ffffff}
+        .cd-option.selected{background:rgba(79,131,255,0.35);color:#93c5fd;font-weight:700}
         .modal-actions{display:flex;gap:0.75rem;justify-content:flex-end;margin-top:1.5rem}
 
         /* ── Toast ── */
@@ -912,9 +937,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <!-- ════ BOOK APPOINTMENT MODAL ════ -->
-<div class="modal-bg" id="book-modal">
+<div class="modal-bg" id="book-modal" onclick="if(event.target===this)closeBookModal()">
     <div class="modal">
-        <div class="modal-title"><i data-lucide="calendar" style="width:20px;height:20px;color:var(--c-primary)"></i> New Appointment</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.25rem">
+            <div class="modal-title" style="margin-bottom:0"><i data-lucide="calendar" style="width:20px;height:20px;color:var(--c-primary)"></i> New Appointment</div>
+            <button onclick="closeBookModal()" style="background:none;border:none;color:var(--c-sub);cursor:pointer;font-size:1.25rem;line-height:1;padding:0.2rem;border-radius:4px" onmouseenter="this.style.color='#fff'" onmouseleave="this.style.color='var(--c-sub)'">✕</button>
+        </div>
         <div class="modal-sub">Book a new patient appointment manually</div>
         <div class="form-row">
             <label class="form-label">Patient Full Name</label>
@@ -930,7 +958,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div class="form-row">
             <label class="form-label">Time Slot</label>
-            <select class="form-input" id="m-time"><option value="">— select a date first —</option></select>
+            <input type="hidden" id="m-time" value="">
+            <div class="custom-dropdown" id="m-time-dropdown">
+                <div class="cd-trigger" onclick="toggleCustomDropdown(event)">
+                    <span id="cd-label">Select a time slot…</span>
+                    <span class="cd-arrow">▾</span>
+                </div>
+                <div class="cd-menu" id="cd-menu">
+                    <div style="padding:0.6rem 0.85rem;color:var(--c-sub);font-size:0.82rem">Select a date first</div>
+                </div>
+            </div>
         </div>
         <div class="modal-actions">
             <button class="btn btn-ghost" onclick="closeBookModal()">Cancel</button>
@@ -1293,6 +1330,20 @@ function openBookModal(){
     loadModalSlots();
     refreshIcons();
 }
+function closeBookModal(){
+    document.getElementById('book-modal')?.classList.remove('open');
+}
+function toggleCustomDropdown(e){
+    if(e) e.stopPropagation();
+    document.getElementById('m-time-dropdown')?.classList.toggle('open');
+}
+document.addEventListener('click', (e)=>{
+    const dd = document.getElementById('m-time-dropdown');
+    if(dd && !dd.contains(e.target)){
+        dd.classList.remove('open');
+    }
+});
+
 function fmtTime(s){
     if(!s) return '';
     const [h,m]=s.split(':').map(Number);
@@ -1300,17 +1351,46 @@ function fmtTime(s){
     const h12=h%12||12;
     return `${String(h12).padStart(2,'0')}:${String(m).padStart(2,'0')} ${ampm} (${s})`;
 }
+
 async function loadModalSlots(){
     const d=document.getElementById('m-date').value;
-    const sel=document.getElementById('m-time');
-    if(!d){ sel.innerHTML='<option value="">— select a date first —</option>'; return }
+    const menu=document.getElementById('cd-menu');
+    const label=document.getElementById('cd-label');
+    const input=document.getElementById('m-time');
+    input.value='';
+    label.textContent='Select a time slot…';
+    if(!d){ menu.innerHTML='<div style="padding:0.6rem 0.85rem;color:var(--c-sub);font-size:0.82rem">Select a date first</div>'; return }
     const r=await api(`/api/slots?date=${d}`);
-    sel.innerHTML=r.available_slots.map(s=>`<option value="${s}">${fmtTime(s)}</option>`).join('')||'<option value="">No available slots on this date</option>';
+    if(!r.available_slots || !r.available_slots.length){
+        menu.innerHTML='<div style="padding:0.6rem 0.85rem;color:var(--c-rose);font-size:0.82rem">No available slots on this date</div>';
+        return;
+    }
+    menu.innerHTML=r.available_slots.map(s=>`
+        <div class="cd-option" data-slot="${s}" onclick="selectCdOption('${s}')">
+            <span>${fmtTime(s)}</span>
+        </div>
+    `).join('');
 }
+
+function selectCdOption(slot){
+    document.getElementById('m-time').value = slot;
+    document.getElementById('cd-label').textContent = fmtTime(slot);
+    document.querySelectorAll('.cd-option').forEach(opt=>{
+        if(opt.dataset.slot===slot){
+            opt.classList.add('selected');
+        } else {
+            opt.classList.remove('selected');
+        }
+    });
+    document.getElementById('m-time-dropdown').classList.remove('open');
+}
+
 function prefillBook(date,time){
     openBookModal();
     document.getElementById('m-date').value=date;
-    loadModalSlots().then(()=>{document.getElementById('m-time').value=time});
+    loadModalSlots().then(()=>{
+        selectCdOption(time);
+    });
 }
 async function submitBook(){
     const name=document.getElementById('m-name').value.trim();
@@ -1356,11 +1436,13 @@ async function toggleCall(){
     if(!callActive) await startCall(); else hangupCall();
 }
 
+let currentRoom = null;
 async function startCall(){
     try{
         const res=await api('/api/call/token');
         if(!res.token){ toast('Could not get call token. Is the agent running?','err'); return }
         const {token,livekit_url,room}=res;
+        currentRoom=room;
         if(!window.LivekitClient){
             await loadScript('https://cdn.jsdelivr.net/npm/livekit-client@2.5.7/dist/livekit-client.umd.min.js');
         }
@@ -1371,7 +1453,7 @@ async function startCall(){
         lkRoom.on(window.LivekitClient.RoomEvent.DataReceived,(payload)=>{
             try{ const m=JSON.parse(new TextDecoder().decode(payload)); if(m.type==='transcript') appendWidgetTranscript(m.role,m.text) } catch{}
         });
-        lkRoom.on(window.LivekitClient.RoomEvent.Disconnected,()=>{ callActive=false; setCallUI(false); toast('Call ended','info') });
+        lkRoom.on(window.LivekitClient.RoomEvent.Disconnected,()=>{ hangupCall(); });
         await lkRoom.connect(livekit_url,token,{autoSubscribe:true});
         const tracks=await window.LivekitClient.createLocalTracks({audio:true,video:false});
         for(const t of tracks) await lkRoom.localParticipant.publishTrack(t);
@@ -1382,9 +1464,14 @@ async function startCall(){
     }catch(e){ toast('Call failed: '+e.message,'err'); setCallUI(false) }
 }
 
-function hangupCall(){
-    if(lkRoom){ lkRoom.disconnect(); lkRoom=null; }
+async function hangupCall(){
+    const room = currentRoom;
+    if(lkRoom){ try{ lkRoom.disconnect(); }catch(e){} lkRoom=null; }
     callActive=false; setCallUI(false); stopViz();
+    if(room){
+        currentRoom=null;
+        await fetch('/api/call/notify_end',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:room})}).catch(()=>{});
+    }
 }
 
 function setCallUI(on){
@@ -1622,15 +1709,35 @@ async def call_token_api(request):
 
 
 async def call_notify_start_api(request):
-    """Called by the browser after connecting to LiveKit."""
+    """Called by the browser or agent when a call starts to register active state."""
     try:
         payload = await request.json()
-        sid = payload.get("session_id", uuid.uuid4().hex)
-        caller = payload.get("caller", "Web Caller")
-        await notify_call_started(sid, caller)
+        sid = payload.get("session_id")
+        caller = payload.get("caller")
+        if sid:
+            await notify_call_started(sid, caller)
         return web.json_response({"ok": True})
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def call_notify_end_api(request):
+    """Called by the browser or agent when a call finishes to clear active state."""
+    try:
+        payload = await request.json()
+        sid = payload.get("session_id")
+        if sid:
+            await notify_call_ended(sid)
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+
+async def clear_active_calls_api(request):
+    """Utility endpoint to purge stale/orphan test calls from memory."""
+    _active_calls.clear()
+    await broadcast({"type": "call_ended", "session_id": "ALL"})
+    return web.json_response({"ok": True, "message": "Cleared all active call sessions"})
 
 
 # ─────────────────────────────────────────────
@@ -1650,6 +1757,8 @@ async def main():
     app.router.add_post('/api/cancel/{id}', cancel_api)
     app.router.add_get('/api/call/token', call_token_api)
     app.router.add_post('/api/call/notify_start', call_notify_start_api)
+    app.router.add_post('/api/call/notify_end', call_notify_end_api)
+    app.router.add_post('/api/calls/clear_active', clear_active_calls_api)
 
     runner = web.AppRunner(app)
     await runner.setup()
