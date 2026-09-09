@@ -352,6 +352,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         .form-input:focus,.search-wrap input:focus{border-color:var(--c-primary);box-shadow:0 0 0 3px var(--c-primary-glow)}
         .form-input{padding-left:0.85rem}
+        .form-input option, select.form-input option {
+            background-color: #0c1526 !important;
+            color: #f1f5f9 !important;
+            padding: 10px 14px;
+            font-size: 0.9rem;
+        }
 
         /* ── Filter Chips ── */
         .chip-group{display:flex;gap:0.4rem}
@@ -1280,13 +1286,19 @@ function openBookModal(){
     loadModalSlots();
     refreshIcons();
 }
-function closeBookModal(){ document.getElementById('book-modal').classList.remove('open') }
+function fmtTime(s){
+    if(!s) return '';
+    const [h,m]=s.split(':').map(Number);
+    const ampm=h>=12?'PM':'AM';
+    const h12=h%12||12;
+    return `${String(h12).padStart(2,'0')}:${String(m).padStart(2,'0')} ${ampm} (${s})`;
+}
 async function loadModalSlots(){
     const d=document.getElementById('m-date').value;
     const sel=document.getElementById('m-time');
-    if(!d){ sel.innerHTML='<option>— select a date first —</option>'; return }
+    if(!d){ sel.innerHTML='<option value="">— select a date first —</option>'; return }
     const r=await api(`/api/slots?date=${d}`);
-    sel.innerHTML=r.available_slots.map(s=>`<option value="${s}">${s}</option>`).join('')||'<option value="">No available slots</option>';
+    sel.innerHTML=r.available_slots.map(s=>`<option value="${s}">${fmtTime(s)}</option>`).join('')||'<option value="">No available slots on this date</option>';
 }
 function prefillBook(date,time){
     openBookModal();
