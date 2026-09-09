@@ -531,11 +531,11 @@ async def entrypoint(ctx: JobContext):
         prefix_padding_duration=0.3,
     )
 
-    # Speech-to-Text: Cartesia Ink-Whisper (Multilingual Hindi + English + Hinglish)
-    logger.info("Using Cartesia Ink-Whisper STT")
+    # Speech-to-Text: Cartesia Ink-2 (Ultra-low latency STT)
+    logger.info("Using Cartesia Ink-2 STT")
     stt_provider = cartesia.STT(
         api_key=config.CARTESIA_API_KEY,
-        model="ink-whisper"
+        model="ink-2"
     )
 
     # Text-to-Speech: Cartesia Sonic-Turbo Neural Voice Engine
