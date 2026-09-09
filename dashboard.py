@@ -345,16 +345,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .search-icon{position:absolute;left:0.85rem;top:50%;transform:translateY(-50%);color:var(--c-sub);width:16px;height:16px}
         .form-input,.search-wrap input{
             width:100%;padding:0.6rem 0.85rem 0.6rem 2.4rem;
-            background:rgba(0,0,0,0.3);border:1px solid var(--c-border);
+            background:rgba(8,15,30,0.9);border:1px solid var(--c-border);
             border-radius:var(--radius-sm);color:var(--c-text);
             font-size:0.88rem;font-family:'Plus Jakarta Sans',sans-serif;
             transition:all 0.2s;outline:none;
+            color-scheme: dark;
         }
         .form-input:focus,.search-wrap input:focus{border-color:var(--c-primary);box-shadow:0 0 0 3px var(--c-primary-glow)}
         .form-input{padding-left:0.85rem}
-        .form-input option, select.form-input option {
+        select.form-input{
+            color-scheme: dark;
+            background-color: #0c1526;
+            color: #ffffff;
+        }
+        select.form-input option {
+            background: #0c1526 !important;
             background-color: #0c1526 !important;
-            color: #f1f5f9 !important;
+            color: #ffffff !important;
             padding: 10px 14px;
             font-size: 0.9rem;
         }
