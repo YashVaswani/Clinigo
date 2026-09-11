@@ -240,6 +240,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .btn-rose:hover{background:var(--c-rose);color:#fff}
         .btn-sm{padding:0.4rem 0.8rem;font-size:0.8rem}
 
+        .top-nav-tabs{
+            display:flex;align-items:center;gap:0.3rem;
+            background:rgba(255,255,255,0.03);
+            padding:0.25rem 0.35rem;
+            border-radius:var(--radius-sm);
+            border:1px solid var(--c-border);
+            margin:0 1rem;
+        }
+        .top-tab{
+            display:inline-flex;align-items:center;gap:0.4rem;
+            padding:0.4rem 0.75rem;
+            border-radius:var(--radius-xs);
+            font-size:0.8rem;font-weight:600;color:var(--c-sub);
+            background:none;border:none;cursor:pointer;
+            transition:all 0.2s ease;
+        }
+        .top-tab:hover{background:rgba(255,255,255,0.06);color:var(--c-text)}
+        .top-tab.active{
+            background:var(--c-primary);color:#fff;
+            box-shadow:0 0 12px var(--c-primary-glow);
+        }
+
         /* ── Page Content Area ── */
         .page-content{flex:1;overflow-y:auto;padding:1.75rem 2rem}
 
@@ -260,8 +282,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             padding:1.25rem;
             position:relative;overflow:hidden;
             transition:all 0.2s;backdrop-filter:blur(12px);
+            cursor:pointer;
         }
-        .kpi:hover{border-color:var(--c-border-h);transform:translateY(-2px)}
+        .kpi:hover{border-color:var(--c-primary);transform:translateY(-3px);box-shadow:0 6px 20px rgba(0,0,0,0.3)}
         .kpi::after{
             content:'';position:absolute;top:0;left:0;right:0;height:2px;
             background:var(--accent,var(--c-primary));
@@ -566,7 +589,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- ════ SIDEBAR ════ -->
     <nav class="sidebar">
-        <div class="brand">
+        <div class="brand" onclick="navigate('overview')" style="cursor:pointer" title="Go to Overview">
             <div class="brand-icon"><i data-lucide="stethoscope" style="width:22px;height:22px"></i></div>
             <div>
                 <div class="brand-title">Clinigo</div>
@@ -628,31 +651,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <!-- ══ OVERVIEW ══ -->
             <div class="section active" id="section-overview">
                 <div class="kpi-row">
-                    <div class="kpi emerald">
+                    <div class="kpi emerald" onclick="navigate('appointments')" title="Click to view Appointments">
                         <div class="kpi-icon"><i data-lucide="calendar" style="width:18px;height:18px"></i></div>
                         <div class="kpi-label">Today's Appointments</div>
                         <div class="kpi-val" id="k-today">—</div>
                         <div class="kpi-sub" id="k-today-sub">Loading…</div>
                     </div>
-                    <div class="kpi cyan">
+                    <div class="kpi cyan" onclick="navigate('calls')" title="Click to view Call History">
                         <div class="kpi-icon"><i data-lucide="phone-call" style="width:18px;height:18px"></i></div>
                         <div class="kpi-label">Calls Today</div>
                         <div class="kpi-val" id="k-calls">—</div>
                         <div class="kpi-sub">Total voice sessions</div>
                     </div>
-                    <div class="kpi violet">
+                    <div class="kpi violet" onclick="navigate('calls')" title="Click to view Call History">
                         <div class="kpi-icon"><i data-lucide="clock" style="width:18px;height:18px"></i></div>
                         <div class="kpi-label">Avg Call Duration</div>
                         <div class="kpi-val" id="k-dur">—</div>
                         <div class="kpi-sub">Seconds per session</div>
                     </div>
-                    <div class="kpi amber">
+                    <div class="kpi amber" onclick="navigate('appointments')" title="Click to view Appointments">
                         <div class="kpi-icon"><i data-lucide="check-circle-2" style="width:18px;height:18px"></i></div>
                         <div class="kpi-label">Bookings This Week</div>
                         <div class="kpi-val" id="k-week">—</div>
                         <div class="kpi-sub">New appointments booked</div>
                     </div>
-                    <div class="kpi">
+                    <div class="kpi" onclick="navigate('live')" title="Click to view Live Calls">
                         <div class="kpi-icon"><i data-lucide="radio" style="width:18px;height:18px"></i></div>
                         <div class="kpi-label">Active Calls Now</div>
                         <div class="kpi-val" id="k-live">0</div>
@@ -1016,7 +1039,7 @@ const NAV_META = {
     slots:        ['Slot Manager','View and manage daily appointment slots'],
     health:       ['AI Infrastructure Health','Service diagnostics and system status'],
 };
-function navigate(section){
+function navigate(section, pushHistory = true){
     document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
     document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
     document.getElementById('nav-'+section)?.classList.add('active');
@@ -1024,12 +1047,32 @@ function navigate(section){
     const [t,s] = NAV_META[section]||['Dashboard',''];
     document.getElementById('topbar-title').textContent = t;
     document.getElementById('topbar-sub').textContent = s;
+
+    if(pushHistory){
+        if(location.hash !== '#' + section){
+            history.pushState({section: section}, '', '#' + section);
+        }
+    }
+
     if(section==='appointments') loadAppointments();
     if(section==='calls') loadCalls();
     if(section==='slots') initSlotDate();
     if(section==='health') checkHealth();
     setTimeout(refreshIcons, 50);
 }
+
+// Handle Browser Back (<-) & Forward (->) Navigation
+window.addEventListener('popstate', (e)=>{
+    const sec = e.state?.section || location.hash.replace('#','') || 'overview';
+    navigate(sec, false);
+});
+
+// Sync initial section on page load
+window.addEventListener('DOMContentLoaded', ()=>{
+    const initSec = location.hash.replace('#','') || 'overview';
+    navigate(initSec, false);
+});
+
 document.querySelectorAll('.nav-item').forEach(btn=>{
     btn.addEventListener('click',()=>navigate(btn.dataset.section));
 });
@@ -1247,32 +1290,57 @@ async function loadCalls(){
 function renderCalls(){
     const q=(document.getElementById('call-search')?.value||'').toLowerCase();
     let d=allCalls;
-    if(q) d=d.filter(c=>(c.caller_phone||'').includes(q)||(c.outcome||'').toLowerCase().includes(q)||(c.summary||'').toLowerCase().includes(q));
+    if(q) d=d.filter(c=>(c.caller_phone||'').toLowerCase().includes(q)||(c.outcome||'').toLowerCase().includes(q)||(c.summary||'').toLowerCase().includes(q));
     const el=document.getElementById('call-list');
     if(!d.length){
         el.innerHTML='<div class="empty"><div class="empty-icon"><i data-lucide="phone-off" style="width:36px;height:36px"></i></div><div class="empty-text">No call sessions found</div></div>';
         refreshIcons();
         return;
     }
-    el.innerHTML=d.map((c,i)=>`
+    el.innerHTML=d.map((c,i)=>{
+        const callerStr = c.caller_phone || 'Web Call (Browser)';
+        let iconName = 'phone-incoming';
+        let iconBg = 'rgba(79,131,255,0.15)';
+        let iconColor = 'var(--c-primary)';
+        let typeBadge = '<span class="badge badge-blue" style="font-size:0.7rem"><i data-lucide="phone" style="width:11px;height:11px;vertical-align:-1px;margin-right:3px"></i>SIP Telephony</span>';
+
+        if(c.is_dograh || callerStr.includes('Dograh')){
+            iconName = 'cpu';
+            iconBg = 'rgba(139,92,246,0.15)';
+            iconColor = 'var(--c-violet)';
+            typeBadge = '<span class="badge badge-violet" style="font-size:0.7rem"><i data-lucide="cpu" style="width:11px;height:11px;vertical-align:-1px;margin-right:3px"></i>Dograh Engine</span>';
+        } else if(callerStr.includes('Web Call') || callerStr.includes('Browser') || callerStr === 'Web Session'){
+            iconName = 'globe';
+            iconBg = 'rgba(34,211,238,0.15)';
+            iconColor = 'var(--c-cyan)';
+            typeBadge = '<span class="badge badge-cyan" style="font-size:0.7rem"><i data-lucide="globe" style="width:11px;height:11px;vertical-align:-1px;margin-right:3px"></i>Web Call</span>';
+        }
+
+        return `
     <div style="background:rgba(255,255,255,0.02);border:1px solid var(--c-border);border-radius:12px;padding:1rem 1.25rem;margin-bottom:0.75rem;transition:all 0.2s" onmouseenter="this.style.borderColor='var(--c-border-h)'" onmouseleave="this.style.borderColor='var(--c-border)'">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem">
             <div style="display:flex;align-items:center;gap:0.75rem">
-                <div style="width:40px;height:40px;border-radius:10px;background:rgba(79,131,255,0.15);display:flex;align-items:center;justify-content:center;color:var(--c-primary)"><i data-lucide="phone-call" style="width:20px;height:20px"></i></div>
+                <div style="width:40px;height:40px;border-radius:10px;background:${iconBg};display:flex;align-items:center;justify-content:center;color:${iconColor}">
+                    <i data-lucide="${iconName}" style="width:20px;height:20px"></i>
+                </div>
                 <div>
-                    <div style="font-weight:700">${c.caller_phone||'<span style="color:var(--c-muted)">Web Session</span>'}</div>
-                    <div style="font-size:0.75rem;color:var(--c-sub)">${new Date(c.started_at).toLocaleString('en-IN')}</div>
+                    <div style="font-weight:700;display:flex;align-items:center;gap:0.4rem">
+                        <span>${esc(callerStr)}</span>
+                        ${typeBadge}
+                    </div>
+                    <div style="font-size:0.75rem;color:var(--c-sub);margin-top:2px">${new Date(c.started_at).toLocaleString('en-IN')}</div>
                 </div>
             </div>
             <div style="display:flex;align-items:center;gap:0.5rem">
-                <span class="badge badge-violet">${c.duration_seconds!=null?c.duration_seconds+'s':'—'}</span>
+                <span class="badge badge-violet"><i data-lucide="clock" style="width:11px;height:11px;vertical-align:-1px;margin-right:3px"></i>${c.duration_seconds!=null?c.duration_seconds+'s':'—'}</span>
                 ${outBadge(c.outcome)}
-                <button class="btn btn-ghost btn-sm" onclick="toggleDrawer('dr-${i}')">Transcript ▾</button>
+                <button class="btn btn-ghost btn-sm" onclick="toggleDrawer('dr-${i}')"><i data-lucide="file-text" style="width:14px;height:14px;margin-right:4px"></i>Transcript ▾</button>
             </div>
         </div>
         ${c.summary?`<div style="font-size:0.82rem;color:var(--c-sub);margin-top:0.4rem"><strong>Summary:</strong> ${esc(c.summary)}</div>`:''}
         <div class="drawer" id="dr-${i}">${fmtTranscript(c.transcript)}</div>
-    </div>`).join('');
+    </div>`;
+    }).join('');
     refreshIcons();
 }
 function toggleDrawer(id){ document.getElementById(id)?.classList.toggle('open') }
@@ -1282,7 +1350,7 @@ function fmtTranscript(t){
         const p=JSON.parse(t);
         if(Array.isArray(p)) return p.map(m=>`<div style="margin-bottom:0.5rem"><strong style="color:${m.role==='agent'?'#93c5fd':'#86efac'}">${m.role==='agent'?'AI':'Patient'}:</strong> ${esc(m.content||m.text||'')}</div>`).join('');
     }catch{}
-    return esc(t);
+    return esc(t).replace(/\n/g, '<br>');
 }
 
 // ═══════════════════════════════════
@@ -1447,14 +1515,32 @@ async function startCall(){
             await loadScript('https://cdn.jsdelivr.net/npm/livekit-client@2.5.7/dist/livekit-client.umd.min.js');
         }
         lkRoom=new window.LivekitClient.Room({adaptiveStream:true,dynacast:true});
-        lkRoom.on(window.LivekitClient.RoomEvent.TrackSubscribed,(track)=>{
-            if(track.kind==='audio'){ const a=track.attach(); a.autoplay=true; document.body.appendChild(a); }
+        lkRoom.on(window.LivekitClient.RoomEvent.TrackSubscribed,(track, pub, participant)=>{
+            if(track.kind==='audio' || (pub && pub.kind==='audio')){
+                const a=track.attach();
+                a.autoplay=true;
+                document.body.appendChild(a);
+                a.play().catch(e=>console.warn('Audio play notice:', e));
+            }
         });
         lkRoom.on(window.LivekitClient.RoomEvent.DataReceived,(payload)=>{
             try{ const m=JSON.parse(new TextDecoder().decode(payload)); if(m.type==='transcript') appendWidgetTranscript(m.role,m.text) } catch{}
         });
         lkRoom.on(window.LivekitClient.RoomEvent.Disconnected,()=>{ hangupCall(); });
         await lkRoom.connect(livekit_url,token,{autoSubscribe:true});
+        if(lkRoom.startAudio) await lkRoom.startAudio().catch(e=>console.warn('startAudio notice:', e));
+        
+        // Attach any audio tracks from remote participants already in room
+        for(const p of lkRoom.remoteParticipants.values()){
+            for(const pub of p.trackPublications.values()){
+                if(pub.track && pub.track.kind==='audio'){
+                    const a=pub.track.attach();
+                    a.autoplay=true;
+                    document.body.appendChild(a);
+                    a.play().catch(e=>console.warn('Existing audio play notice:', e));
+                }
+            }
+        }
         const tracks=await window.LivekitClient.createLocalTracks({audio:true,video:false});
         for(const t of tracks) await lkRoom.localParticipant.publishTrack(t);
         callActive=true; setCallUI(true);

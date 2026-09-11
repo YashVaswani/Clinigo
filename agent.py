@@ -522,13 +522,13 @@ async def entrypoint(ctx: JobContext):
     # Auto-initialize database tables and schema migrations
     appointments_db.initialize_db()
 
-    # Voice Activity Detection — balanced: filters echo/noise but still detects normal speech
-    # activation_threshold=0.6: detects clear speech but ignores faint background hum
-    # (0.75 was too high — was blocking normal English speech)
+    # Voice Activity Detection — production industry-standard parameters
     silero_vad = silero.VAD.load(
-        activation_threshold=0.6,     # balanced: detects speech, ignores ambient noise
+        activation_threshold=0.6,     # speech sensitivity (filters background ambient noise)
+        min_speech_duration=0.08,     # ignores brief mic pops, coughs, and keyboard taps (<80ms)
         min_silence_duration=0.5,     # 0.5s silence needed to end a speech segment
-        prefix_padding_duration=0.3,
+        prefix_padding_duration=0.3,  # 300ms pre-buffer prevents clipping initial letters
+        max_speech_duration=15.0,     # max 15s continuous speech segment limit
     )
 
     # Speech-to-Text: Cartesia Ink-2 (Ultra-low latency STT)
@@ -539,10 +539,10 @@ async def entrypoint(ctx: JobContext):
     )
 
     # Text-to-Speech: Cartesia Sonic-Turbo Neural Voice Engine
-    logger.info(f"Using Cartesia TTS (Voice: {config.CARTESIA_VOICE_ID or 'c6bbc7d5-4b35-4d49-b1c6-4417019a61c1'})")
-    tts_provider = DynamicCartesiaTTS(
+    tts_provider = cartesia.TTS(
         api_key=config.CARTESIA_API_KEY,
-        voice_id=config.CARTESIA_VOICE_ID or "c6bbc7d5-4b35-4d49-b1c6-4417019a61c1"
+        voice=config.CARTESIA_VOICE_ID or "c6bbc7d5-4b35-4d49-b1c6-4417019a61c1",
+        model="sonic-2"
     )
 
     # Compile the list of LLM providers for the fallback chain
@@ -632,14 +632,14 @@ Language:
 - If the caller mixes Hindi and English (Hinglish), match their style naturally.
 """
 
-    # Extract caller identity from incoming SIP metadata if available
-    caller_phone = None
+    # Extract caller identity from incoming SIP or Web Browser metadata
+    caller_phone = "Web Call (Browser)"
     for participant in ctx.room.remote_participants.values():
         identity = participant.identity
         if identity.startswith("sip:"):
             caller_phone = identity.replace("sip:", "")
             break
-        elif identity.startswith("+"):
+        elif identity.startswith("+") or identity.isdigit():
             caller_phone = identity
             break
 

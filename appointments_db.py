@@ -174,8 +174,96 @@ def log_call_session(
         logger.exception(f"Failed to save call session {session_id}")
 
 
+DOGRAH_DB_PASS = os.getenv("DOGRAH_DB_PASS", "a226feafa2153fd9300e844c0c89ff545d1ee3c4512f7a83a3b1af670a53d5dc")
+
+
+def get_dograh_call_runs(limit: int = 50) -> list[dict]:
+    """Fetches workflow runs from Dograh's local PostgreSQL database."""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("DOGRAH_DB_HOST", "127.0.0.1"),
+            port=int(os.getenv("DOGRAH_DB_PORT", 5432)),
+            dbname=os.getenv("DOGRAH_DB_NAME", "postgres"),
+            user=os.getenv("DOGRAH_DB_USER", "postgres"),
+            password=DOGRAH_DB_PASS,
+            connect_timeout=3
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, mode, created_at, state, call_type, initial_context, gathered_context, logs
+                FROM workflow_runs
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,)
+            )
+            rows = cur.fetchall()
+        conn.close()
+
+        dograh_calls = []
+        for r in rows:
+            run_id, name, mode, created_at, state, call_type, init_ctx, gath_ctx, logs = r
+            init_ctx = init_ctx or {}
+            gath_ctx = gath_ctx or {}
+            
+            # Format caller phone number or label
+            from_num = init_ctx.get("from_number") or init_ctx.get("caller_phone") or ""
+            run_name = name or f"WR-{run_id}"
+            if from_num:
+                caller = f"{from_num} (Dograh {run_name})"
+            elif mode == "smallwebrtc" or "webrtc" in str(mode).lower():
+                caller = f"Dograh Web Call ({run_name})"
+            else:
+                caller = f"Dograh Call ({run_name})"
+            
+            # Format summary & outcome
+            visited = gath_ctx.get("nodes_visited") or []
+            disp = gath_ctx.get("call_disposition") or state or "COMPLETED"
+            
+            summary_parts = [f"Dograh Workflow Run: {run_name} ({mode})"]
+            if visited:
+                summary_parts.append(f"Visited: {' -> '.join(visited)}")
+            if disp:
+                summary_parts.append(f"Disposition: {disp}")
+            
+            summary = " | ".join(summary_parts)
+            outcome = (disp or state or "COMPLETED").upper()
+            
+            # Build text transcript preview from gathered context & logs if available
+            transcript_lines = [
+                f"[Dograh Engine] Workflow: {run_name} | Mode: {mode} | Type: {call_type}",
+                f"State: {state} | Disposition: {disp}",
+            ]
+            if visited:
+                transcript_lines.append(f"Flow Steps: {' -> '.join(visited)}")
+            if gath_ctx.get("call_tags"):
+                transcript_lines.append(f"Tags: {', '.join(gath_ctx['call_tags'])}")
+                
+            transcript = "\n".join(transcript_lines)
+            
+            dograh_calls.append({
+                "session_id": f"dograh-{run_id}",
+                "caller_phone": caller,
+                "started_at": str(created_at),
+                "ended_at": "",
+                "duration_seconds": 0,
+                "transcript": transcript,
+                "summary": summary,
+                "outcome": outcome,
+                "is_dograh": True,
+                "dograh_run_id": run_id,
+                "dograh_name": run_name
+            })
+        return dograh_calls
+    except Exception as e:
+        logger.warning(f"Could not fetch Dograh workflow runs (Dograh DB may be offline): {e}")
+        return []
+
+
 def get_call_sessions(limit: int = 50) -> list[dict]:
-    """Returns the most recent call sessions for review with full conversation transcripts."""
+    """Returns recent call sessions merging LiveKit sessions and Dograh workflow runs."""
+    lk_calls = []
     try:
         with get_db_cursor() as cur:
             cur.execute(
@@ -189,18 +277,32 @@ def get_call_sessions(limit: int = 50) -> list[dict]:
                 (limit,)
             )
             rows = cur.fetchall()
-        return [
-            {
-                "session_id": r[0], "caller_phone": r[1],
-                "started_at": str(r[2]), "ended_at": str(r[3]),
-                "duration_seconds": r[4], "transcript": r[5] or "",
-                "summary": r[6] or "", "outcome": r[7] or "COMPLETED"
-            }
-            for r in rows
-        ]
+        for r in rows:
+            caller = r[1]
+            if not caller or str(caller).strip().lower() in ("none", "null", "", "web", "unknown"):
+                caller = "Web Call (Browser)"
+            
+            lk_calls.append({
+                "session_id": r[0],
+                "caller_phone": caller,
+                "started_at": str(r[2]),
+                "ended_at": str(r[3]) if r[3] else "",
+                "duration_seconds": r[4] or 0,
+                "transcript": r[5] or "",
+                "summary": r[6] or "",
+                "outcome": r[7] or "COMPLETED"
+            })
     except Exception as e:
-        logger.exception("Failed to retrieve call sessions")
-        return []
+        logger.exception("Failed to retrieve LiveKit call sessions")
+
+    # Fetch Dograh call runs
+    dograh_calls = get_dograh_call_runs(limit=limit)
+
+    # Merge and sort chronologically descending by started_at
+    combined = lk_calls + dograh_calls
+    combined.sort(key=lambda x: str(x.get("started_at", "")), reverse=True)
+    return combined[:limit]
+
 
 
 def get_available_slots(date_str: str) -> list[str]:
