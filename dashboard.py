@@ -858,10 +858,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <div class="kpi-sub">Groq + Cartesia</div>
                     </div>
                     <div class="kpi cyan">
-                        <div class="kpi-icon"><i data-lucide="network" style="width:18px;height:18px"></i></div>
-                        <div class="kpi-label">LiveKit</div>
+                        <div class="kpi-icon"><i data-lucide="cpu" style="width:18px;height:18px"></i></div>
+                        <div class="kpi-label">Dograh Engine</div>
                         <div class="kpi-val" id="hk-lk">—</div>
-                        <div class="kpi-sub">WebRTC Bridge</div>
+                        <div class="kpi-sub">SmallWebRTC</div>
                     </div>
                 </div>
 
@@ -886,7 +886,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             </div>
                             <div class="health-item">
                                 <div class="health-indicator h-warn" id="hi-lk"></div>
-                                <div><div class="health-name">LiveKit WebRTC</div><div class="health-lat" id="hl-lk">Not checked</div></div>
+                                <div><div class="health-name">Dograh SmallWebRTC</div><div class="health-lat" id="hl-lk">Not checked</div></div>
                             </div>
                             <div class="health-item">
                                 <div class="health-indicator h-ok" id="hi-ws"></div>
@@ -915,7 +915,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </div>
                                 <div style="display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid rgba(255,255,255,0.05)">
                                     <span style="color:var(--c-sub);font-size:0.85rem">Voice Transport</span>
-                                    <span style="font-weight:600;font-size:0.85rem">LiveKit WebRTC</span>
+                                    <span style="font-weight:600;font-size:0.85rem">Dograh SmallWebRTC</span>
                                 </div>
                                 <div style="display:flex;justify-content:space-between;padding:0.5rem 0">
                                     <span style="color:var(--c-sub);font-size:0.85rem">Clinic</span>
@@ -1013,7 +1013,7 @@ let apptFilter = 'ALL';
 let ws = null;
 let wsRetry = 0;
 let callActive = false;
-let lkRoom = null;
+
 let cpAnim = null;
 
 function refreshIcons(){
@@ -1483,9 +1483,12 @@ async function checkHealth(){
     }catch{setH('db','err','Unreachable'); document.getElementById('hk-db').textContent='ERR'}
     setH('groq','ok','llama-3.1-70b-versatile'); setH('cart','ok','Cartesia Sonic-2');
     document.getElementById('hk-agent').textContent='OK';
-    const lk='LIVEKIT_URL_PLACEHOLDER';
-    if(lk&&lk!=='None'){ setH('lk','ok',lk.replace(/wss?:\/\//,'').split('.')[0]+'…'); document.getElementById('hk-lk').textContent='OK'; }
-    else { setH('lk','warn','Not configured'); document.getElementById('hk-lk').textContent='—'; }
+    // Check Dograh SmallWebRTC availability
+    try{
+        const dr=await fetch('/api/call/dograh_health');
+        if(dr.ok){ setH('lk','ok','localhost:8000'); document.getElementById('hk-lk').textContent='OK'; }
+        else { setH('lk','warn','Dograh offline'); document.getElementById('hk-lk').textContent='—'; }
+    }catch{ setH('lk','warn','Dograh unreachable'); document.getElementById('hk-lk').textContent='—'; }
     refreshIcons();
 }
 function setH(k,s,l){
@@ -1504,60 +1507,83 @@ async function toggleCall(){
     if(!callActive) await startCall(); else hangupCall();
 }
 
-let currentRoom = null;
+// ── Dograh SmallWebRTC state ──
+let drPc=null, drWs=null, drStream=null, drPcId=null, drAudioEl=null, drSessionId=null;
+
+function _drPeerId(){ return 'pc_'+Math.random().toString(36).slice(2,10); }
+
 async function startCall(){
     try{
-        const res=await api('/api/call/token');
-        if(!res.token){ toast('Could not get call token. Is the agent running?','err'); return }
-        const {token,livekit_url,room}=res;
-        currentRoom=room;
-        if(!window.LivekitClient){
-            await loadScript('https://cdn.jsdelivr.net/npm/livekit-client@2.5.7/dist/livekit-client.umd.min.js');
-        }
-        lkRoom=new window.LivekitClient.Room({adaptiveStream:true,dynacast:true});
-        lkRoom.on(window.LivekitClient.RoomEvent.TrackSubscribed,(track, pub, participant)=>{
-            if(track.kind==='audio' || (pub && pub.kind==='audio')){
-                const a=track.attach();
-                a.autoplay=true;
-                document.body.appendChild(a);
-                a.play().catch(e=>console.warn('Audio play notice:', e));
+        const res=await api('/api/call/dograh_init',{method:'POST'});
+        if(!res.session_token){ toast('Dograh not available — is it running?','err'); return; }
+        const {session_token, dograh_ws_url, run_id}=res;
+        drSessionId='dograh-run-'+run_id;
+
+        // Microphone
+        drStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+
+        // Audio element for incoming audio
+        drAudioEl=document.createElement('audio'); drAudioEl.autoplay=true;
+        document.body.appendChild(drAudioEl);
+
+        // Peer connection
+        drPc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+        drStream.getTracks().forEach(t=>drPc.addTrack(t,drStream));
+        drPc.ontrack=ev=>{ if(ev.track.kind==='audio') drAudioEl.srcObject=ev.streams[0]; };
+        drPc.onconnectionstatechange=()=>{
+            if(drPc&&(drPc.connectionState==='failed'||drPc.connectionState==='closed')) hangupCall();
+        };
+        drPc.onicecandidate=ev=>{
+            if(drWs&&drWs.readyState===WebSocket.OPEN){
+                drWs.send(JSON.stringify({type:'ice-candidate',payload:{
+                    candidate:ev.candidate?{candidate:ev.candidate.candidate,sdpMid:ev.candidate.sdpMid,sdpMLineIndex:ev.candidate.sdpMLineIndex}:null,
+                    pc_id:drPcId
+                }}));
             }
-        });
-        lkRoom.on(window.LivekitClient.RoomEvent.DataReceived,(payload)=>{
-            try{ const m=JSON.parse(new TextDecoder().decode(payload)); if(m.type==='transcript') appendWidgetTranscript(m.role,m.text) } catch{}
-        });
-        lkRoom.on(window.LivekitClient.RoomEvent.Disconnected,()=>{ hangupCall(); });
-        await lkRoom.connect(livekit_url,token,{autoSubscribe:true});
-        if(lkRoom.startAudio) await lkRoom.startAudio().catch(e=>console.warn('startAudio notice:', e));
-        
-        // Attach any audio tracks from remote participants already in room
-        for(const p of lkRoom.remoteParticipants.values()){
-            for(const pub of p.trackPublications.values()){
-                if(pub.track && pub.track.kind==='audio'){
-                    const a=pub.track.attach();
-                    a.autoplay=true;
-                    document.body.appendChild(a);
-                    a.play().catch(e=>console.warn('Existing audio play notice:', e));
+        };
+
+        // WebSocket signaling
+        drPcId=_drPeerId();
+        await new Promise((res,rej)=>{
+            drWs=new WebSocket(dograh_ws_url);
+            drWs.onopen=res;
+            drWs.onerror=rej;
+            drWs.onclose=()=>{ if(callActive) hangupCall(); };
+            drWs.onmessage=async ev=>{
+                const msg=JSON.parse(ev.data);
+                if(msg.type==='answer'){
+                    await drPc.setRemoteDescription({type:'answer',sdp:msg.payload.sdp});
+                    callActive=true; setCallUI(true); startViz();
+                    toast('Connected to Dograh AI receptionist','ok');
+                    await fetch('/api/call/notify_start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:drSessionId,caller:'Web Caller'})});
+                } else if(msg.type==='ice-candidate'&&msg.payload.candidate){
+                    await drPc.addIceCandidate(msg.payload.candidate).catch(()=>{});
+                } else if(msg.type==='call-ended'){
+                    hangupCall();
                 }
-            }
-        }
-        const tracks=await window.LivekitClient.createLocalTracks({audio:true,video:false});
-        for(const t of tracks) await lkRoom.localParticipant.publishTrack(t);
-        callActive=true; setCallUI(true);
-        toast('Connected! Speak with the AI receptionist','ok');
-        startViz();
-        await fetch('/api/call/notify_start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:room,caller:'Web Caller'})});
-    }catch(e){ toast('Call failed: '+e.message,'err'); setCallUI(false) }
+            };
+        });
+
+        // Offer
+        const offer=await drPc.createOffer();
+        await drPc.setLocalDescription(offer);
+        drWs.send(JSON.stringify({type:'offer',payload:{sdp:offer.sdp,type:'offer',pc_id:drPcId}}));
+    }catch(e){ toast('Call failed: '+e.message,'err'); setCallUI(false); _drCleanup(); }
+}
+
+function _drCleanup(){
+    if(drWs){ try{drWs.close();}catch(e){} drWs=null; }
+    if(drStream){ drStream.getTracks().forEach(t=>t.stop()); drStream=null; }
+    if(drPc){ try{drPc.close();}catch(e){} drPc=null; }
+    if(drAudioEl){ drAudioEl.srcObject=null; drAudioEl.remove(); drAudioEl=null; }
+    drPcId=null;
 }
 
 async function hangupCall(){
-    const room = currentRoom;
-    if(lkRoom){ try{ lkRoom.disconnect(); }catch(e){} lkRoom=null; }
+    const sid=drSessionId; drSessionId=null;
     callActive=false; setCallUI(false); stopViz();
-    if(room){
-        currentRoom=null;
-        await fetch('/api/call/notify_end',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:room})}).catch(()=>{});
-    }
+    _drCleanup();
+    if(sid) await fetch('/api/call/notify_end',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid})}).catch(()=>{});
 }
 
 function setCallUI(on){
@@ -1662,8 +1688,7 @@ async function refreshAll(){ await loadOverview(); refreshIcons(); toast('Dashbo
 #  Inject server-side values into template
 # ─────────────────────────────────────────────
 def render_html():
-    lk_url = config.LIVEKIT_URL or 'None'
-    return HTML_TEMPLATE.replace('LIVEKIT_URL_PLACEHOLDER', lk_url)
+    return HTML_TEMPLATE
 
 
 # ─────────────────────────────────────────────
@@ -1772,26 +1797,47 @@ async def cancel_api(request):
     return web.json_response({"success": False, "message": "Not found"}, status=404)
 
 
-async def call_token_api(request):
-    """Generate a LiveKit access token for a browser web call session."""
+async def dograh_health_api(request):
+    """Lightweight Dograh health check — just verifies embed token exists and Dograh is reachable."""
+    import aiohttp
+    dograh_url = os.getenv("DOGRAH_API_URL", "http://localhost:8000")
+    embed = appointments_db.get_dograh_embed_token()
+    if not embed:
+        return web.json_response({"ok": False, "reason": "no_embed_token"}, status=503)
     try:
-        from livekit.api import AccessToken, VideoGrants
-        room_name = f"web-call-{uuid.uuid4().hex[:12]}"
-        identity = f"patient-web-{uuid.uuid4().hex[:8]}"
-        token = (
-            AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET)
-            .with_identity(identity)
-            .with_name("Web Caller")
-            .with_grants(VideoGrants(room_join=True, room=room_name))
-            .to_jwt()
-        )
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{dograh_url}/api/v1/health", timeout=aiohttp.ClientTimeout(total=3)) as r:
+                return web.json_response({"ok": r.status < 400})
+    except Exception as e:
+        return web.json_response({"ok": False, "reason": str(e)}, status=503)
+
+
+async def dograh_init_api(request):
+    """Proxy to Dograh's public embed init — returns session_token + WebSocket URL."""
+    import aiohttp
+    dograh_url = os.getenv("DOGRAH_API_URL", "http://localhost:8000")
+    try:
+        embed = appointments_db.get_dograh_embed_token()
+        if not embed:
+            return web.json_response({"error": "No active embed token in Dograh DB"}, status=503)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{dograh_url}/api/v1/public/embed/init",
+                json={"token": embed["token"]},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return web.json_response({"error": f"Dograh init failed: {body}"}, status=502)
+                data = await resp.json()
+        ws_url = dograh_url.replace("http", "ws") + f"/api/v1/ws/public/signaling/{data['session_token']}"
         return web.json_response({
-            "token": token,
-            "livekit_url": config.LIVEKIT_URL,
-            "room": room_name,
+            "session_token": data["session_token"],
+            "dograh_ws_url": ws_url,
+            "run_id": data.get("workflow_run_id"),
         })
     except Exception as e:
-        return web.json_response({"error": str(e), "token": None}, status=500)
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def call_notify_start_api(request):
@@ -1841,7 +1887,8 @@ async def main():
     app.router.add_get('/api/calls', get_calls_api)
     app.router.add_get('/api/calls/{session_id}/json', get_call_json_api)
     app.router.add_post('/api/cancel/{id}', cancel_api)
-    app.router.add_get('/api/call/token', call_token_api)
+    app.router.add_get('/api/call/dograh_health', dograh_health_api)
+    app.router.add_post('/api/call/dograh_init', dograh_init_api)
     app.router.add_post('/api/call/notify_start', call_notify_start_api)
     app.router.add_post('/api/call/notify_end', call_notify_end_api)
     app.router.add_post('/api/calls/clear_active', clear_active_calls_api)

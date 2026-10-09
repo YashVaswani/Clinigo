@@ -13,39 +13,106 @@ logging.basicConfig(
 )
 logger = logging.getLogger("appointments_db")
 
+import sqlite3
+
 _pool = None
+_use_sqlite = False
+_sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "appointments.db")
+
+class SQLiteCursorWrapper:
+    def __init__(self, conn):
+        self.conn = conn
+        self.cur = conn.cursor()
+
+    def execute(self, query, params=()):
+        # Convert %s placeholder to ? for SQLite
+        q = query.replace("%s", "?")
+        # Adjust SERIAL & TIMESTAMPTZ types for SQLite
+        q = q.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        q = q.replace("TIMESTAMPTZ", "TIMESTAMP")
+        q = q.replace("NOW()", "CURRENT_TIMESTAMP")
+        
+        # Convert date/time objects in params to str for SQLite
+        cleaned_params = []
+        for p in params:
+            if isinstance(p, (date, time, datetime)):
+                cleaned_params.append(str(p))
+            else:
+                cleaned_params.append(p)
+
+        # Handle RETURNING id for SQLite if needed
+        has_returning = "RETURNING id" in q
+        if has_returning:
+            q = q.replace("RETURNING id", "").strip()
+
+        try:
+            self.cur.execute(q, tuple(cleaned_params))
+            if has_returning and self.cur.lastrowid:
+                self._last_id = [(self.cur.lastrowid,)]
+            else:
+                self._last_id = None
+        except sqlite3.IntegrityError as e:
+            # Raise a pseudo UniqueViolation so existing try/except blocks catch it
+            raise psycopg2.errors.UniqueViolation(str(e)) from e
+
+    def fetchone(self):
+        if getattr(self, "_last_id", None) is not None:
+            res = self._last_id
+            self._last_id = None
+            return res[0]
+        row = self.cur.fetchone()
+        return row
+
+    def fetchall(self):
+        rows = self.cur.fetchall()
+        return rows
+
 
 def get_pool():
-    global _pool
-    if _pool is None:
+    global _pool, _use_sqlite
+    if _pool is None and not _use_sqlite:
         db_url = config.DATABASE_URL
-        if not db_url:
-            logger.error("DATABASE_URL is not set!")
-            raise ValueError("DATABASE_URL environment variable is missing. Set it in the .env file.")
-        try:
-            # Create a ThreadedConnectionPool with TCP keepalives to prevent cloud timeouts
-            _pool = pool.ThreadedConnectionPool(
-                1, 10,
-                dsn=db_url,
-                connect_timeout=4,
-                keepalives=1,
-                keepalives_idle=20,
-                keepalives_interval=5,
-                keepalives_count=3
-            )
-            logger.info("PostgreSQL connection pool initialized successfully.")
-        except Exception as e:
-            logger.exception("Failed to initialize PostgreSQL connection pool")
-            raise
+        if db_url:
+            try:
+                _pool = pool.ThreadedConnectionPool(
+                    1, 10,
+                    dsn=db_url,
+                    connect_timeout=4,
+                    keepalives=1,
+                    keepalives_idle=20,
+                    keepalives_interval=5,
+                    keepalives_count=3
+                )
+                logger.info("PostgreSQL connection pool initialized successfully.")
+                return _pool
+            except Exception as e:
+                logger.warning(f"PostgreSQL pool init failed ({e}). Falling back to local SQLite DB: {_sqlite_path}")
+                _use_sqlite = True
+        else:
+            _use_sqlite = True
     return _pool
 
 @contextlib.contextmanager
 def get_db_cursor():
+    global _use_sqlite
     p = get_pool()
+    if _use_sqlite:
+        conn = sqlite3.connect(_sqlite_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            wrapper = SQLiteCursorWrapper(conn)
+            yield wrapper
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+        return
+
     conn = None
     try:
         conn = p.getconn()
-        # Test if connection is alive; recover gracefully if stale
         try:
             conn.cursor().execute("SELECT 1")
         except Exception:
@@ -178,7 +245,7 @@ DOGRAH_DB_PASS = os.getenv("DOGRAH_DB_PASS", "a226feafa2153fd9300e844c0c89ff545d
 
 
 def get_dograh_call_runs(limit: int = 50) -> list[dict]:
-    """Fetches workflow runs from Dograh's local PostgreSQL database."""
+    """Fetches web call workflow runs from Dograh's local PostgreSQL database, excluding telephony/smartflo."""
     try:
         conn = psycopg2.connect(
             host=os.getenv("DOGRAH_DB_HOST", "127.0.0.1"),
@@ -196,7 +263,7 @@ def get_dograh_call_runs(limit: int = 50) -> list[dict]:
                 ORDER BY created_at DESC
                 LIMIT %s
                 """,
-                (limit,)
+                (limit * 2,)
             )
             rows = cur.fetchall()
         conn.close()
@@ -207,15 +274,14 @@ def get_dograh_call_runs(limit: int = 50) -> list[dict]:
             init_ctx = init_ctx or {}
             gath_ctx = gath_ctx or {}
             
-            # Format caller phone number or label
-            from_num = init_ctx.get("from_number") or init_ctx.get("caller_phone") or ""
             run_name = name or f"WR-{run_id}"
-            if from_num:
-                caller = f"{from_num} (Dograh {run_name})"
-            elif mode == "smallwebrtc" or "webrtc" in str(mode).lower():
-                caller = f"Dograh Web Call ({run_name})"
-            else:
-                caller = f"Dograh Call ({run_name})"
+            from_num = init_ctx.get("from_number") or init_ctx.get("caller_phone") or ""
+            
+            # Exclude telephony / smartflo calls
+            if "smartflo" in str(mode).lower() or "smartflo" in run_name.lower() or from_num:
+                continue
+
+            caller = f"Dograh Web Call ({run_name})"
             
             # Format summary & outcome
             visited = gath_ctx.get("nodes_visited") or []
@@ -255,14 +321,40 @@ def get_dograh_call_runs(limit: int = 50) -> list[dict]:
                 "dograh_run_id": run_id,
                 "dograh_name": run_name
             })
-        return dograh_calls
+        return dograh_calls[:limit]
     except Exception as e:
         logger.warning(f"Could not fetch Dograh workflow runs (Dograh DB may be offline): {e}")
         return []
 
 
+def get_dograh_embed_token() -> dict | None:
+    """Fetch the first active embed token from Dograh's local DB.
+    Returns {token, workflow_id} or None if unavailable."""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("DOGRAH_DB_HOST", "127.0.0.1"),
+            port=int(os.getenv("DOGRAH_DB_PORT", 5432)),
+            dbname=os.getenv("DOGRAH_DB_NAME", "postgres"),
+            user=os.getenv("DOGRAH_DB_USER", "postgres"),
+            password=DOGRAH_DB_PASS,
+            connect_timeout=3
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT token, workflow_id FROM embed_tokens WHERE is_active = TRUE LIMIT 1"
+            )
+            row = cur.fetchone()
+        conn.close()
+        if row:
+            return {"token": row[0], "workflow_id": row[1]}
+        return None
+    except Exception as e:
+        logger.warning(f"Could not fetch Dograh embed token: {e}")
+        return None
+
+
 def get_call_sessions(limit: int = 50) -> list[dict]:
-    """Returns recent call sessions merging LiveKit sessions and Dograh workflow runs."""
+    """Returns recent web call sessions merging LiveKit web sessions and Dograh web workflow runs."""
     lk_calls = []
     try:
         with get_db_cursor() as cur:
@@ -274,13 +366,16 @@ def get_call_sessions(limit: int = 50) -> list[dict]:
                 ORDER BY started_at DESC
                 LIMIT %s
                 """,
-                (limit,)
+                (limit * 2,)
             )
             rows = cur.fetchall()
         for r in rows:
             caller = r[1]
-            if not caller or str(caller).strip().lower() in ("none", "null", "", "web", "unknown"):
-                caller = "Web Call (Browser)"
+            # Exclude raw phone numbers (telephony calls)
+            if caller and (str(caller).startswith("+") or str(caller).isdigit() or "sip:" in str(caller).lower()):
+                continue
+
+            caller = "Web Call (Browser)"
             
             lk_calls.append({
                 "session_id": r[0],
@@ -295,7 +390,7 @@ def get_call_sessions(limit: int = 50) -> list[dict]:
     except Exception as e:
         logger.exception("Failed to retrieve LiveKit call sessions")
 
-    # Fetch Dograh call runs
+    # Fetch Dograh web call runs
     dograh_calls = get_dograh_call_runs(limit=limit)
 
     # Merge and sort chronologically descending by started_at
